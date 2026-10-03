@@ -252,9 +252,28 @@ function compact(n){
 }
 function sign(n){ return n > 0 ? "+" + fmt(n) : fmt(n); }
 
+/* This page is used two ways: served by the console (same origin, relative
+   paths work) and opened straight off disk as file://. Under file:// a
+   relative fetch() resolves to file:///api/... and dies with "Failed to
+   fetch", so point at the console explicitly in that case.
+   Override with ?api=http://127.0.0.1:8799 if you started it on another port. */
+const _q = new URLSearchParams(location.search);
+const API_BASE = _q.get("api")
+  || (location.protocol === "file:" ? "http://127.0.0.1:8787" : "");
+const OFFLINE_HINT = "连不上控制台服务（" + (API_BASE || "当前页面同源") + "）。"
+  + "请在项目根目录运行 start-console.bat，再从 http://127.0.0.1:8787 打开本页。"
+  + "若服务使用了其他端口，在本页地址后加 ?api=http://127.0.0.1:端口号。";
+
 async function api(path, body){
   const opts = body ? { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) } : {};
-  const res = await fetch(path, opts);
+  let res;
+  try {
+    res = await fetch(API_BASE + path, opts);
+  } catch (_) {
+    // fetch only throws on a transport failure: server down, wrong port, or a
+    // cross-origin block. All three have the same fix, so say it once, clearly.
+    throw new Error(OFFLINE_HINT);
+  }
   const json = await res.json().catch(() => ({ ok:false, error:"返回不是合法 JSON" }));
   if(!json.ok) throw new Error(json.error || "请求失败");
   return json.data;
@@ -587,6 +606,14 @@ $("btn-add").addEventListener("click", async () => {
   }catch(e){ toast("写入失败：" + e.message, "bad"); }
 });
 $("btn-reload").addEventListener("click", boot);
+
+// Opened off disk: the API calls will be cross-origin, so say so up front
+// instead of letting every button fail with the same opaque message.
+if(location.protocol === "file:"){
+  banner("本页以文件方式打开，接口将跨源访问 <code>" + API_BASE + "</code>。"
+    + "若始终连接失败，请运行 <b>start-console.bat</b> 后访问 "
+    + "<code>http://127.0.0.1:8787</code>（同源，更稳）。", "warn");
+}
 
 boot();
 </script>

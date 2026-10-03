@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import threading
+import types
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -377,6 +378,38 @@ def test_http_routes_without_network() -> int:
     return failures
 
 
+def test_cors_allows_file_origin_only() -> int:
+    """The page opened off disk must work; a random website must be blocked.
+
+    A blanket `Access-Control-Allow-Origin: *` would let any site on the
+    internet query the console and read the account panel, so the scoping is
+    the security boundary, not a convenience.
+    """
+    failures = 0
+
+    def allowed(origin: str | None) -> str | None:
+        fake = types.SimpleNamespace(
+            headers={} if origin is None else {"Origin": origin})
+        return console_server.ConsoleHandler._cors_origin(fake)
+
+    cases = {
+        None: "*",                                  # same-origin GET, no header
+        "null": "*",                                # file:// page
+        "http://127.0.0.1:8787": "http://127.0.0.1:8787",
+        "http://localhost:9000": "http://localhost:9000",
+        "http://evil.example.com": None,            # must get no CORS header
+        "https://evil.example.com": None,
+        "http://192.168.1.7:8787": None,            # another host on the LAN
+    }
+    for origin, want in cases.items():
+        got = allowed(origin)
+        if got != want:
+            print(f"  FAIL Origin {origin!r}: expected {want!r}, got {got!r}")
+            failures += 1
+    print(f"  cors scoping: {'ok' if not failures else 'FAILED'}")
+    return failures
+
+
 def main() -> int:
     print("console tests (offline)")
     print("")
@@ -394,6 +427,7 @@ def main() -> int:
         test_detect_proxy_survives_a_blocked_network,
         test_settings_roundtrip,
         test_http_routes_without_network,
+        test_cors_allows_file_origin_only,
     ):
         failures += test()
     print("")

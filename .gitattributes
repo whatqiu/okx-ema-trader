@@ -1,3 +1,8 @@
+# `* text=auto` first: it stops core.autocrlf from rewriting files that have
+# an explicit rule below, which otherwise leaves the working tree dirty after
+# every checkout on Windows.
+* text=auto
+
 # .bat MUST stay CRLF: cmd.exe mis-parses a Unix-line-ending batch file and
 # runs fragments of Chinese lines as commands ("'?OKX' is not recognized").
 *.bat text eol=crlf
