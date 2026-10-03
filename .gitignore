@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Runtime output — regenerated, never a source of truth
+logs/
+data/
+state.yaml
+*.log
+
+# Local / machine-specific
+.claude/
+.mcp.json
+.workbuddy/
+.cleanup-backup/
+config/console.json
+
+# Secrets live in ~/.okx/config.toml, never in this repo.
+# If you ever add one here, it is already ignored:
+.env
+*.key
+*.pem
+credentials.toml
+
+# OS
+.DS_Store
+Thumbs.db

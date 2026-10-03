@@ -1,0 +1,40 @@
+# 第一阶段仅订阅 OKX 公共行情，不会下单
+symbol: BTC-USDT-SWAP
+bar_5m: 5m
+bar_15m: 15m
+candle_limit: 200
+
+strategy:
+  ema_fast: 20
+  ema_slow: 60
+  adx_period: 14
+  # ADX 必须严格大于该值：adx <= adx_min 即无信号。
+  adx_min: 20
+  # 15m 偏离度过滤：abs(close - EMA20) / EMA20 <= deviation_max 才允许新开仓。
+  # 只作用于 15m，只作为入场过滤，不影响已持有的仓位。
+  deviation_max: 0.02
+
+runtime:
+  reconnect_seconds: 5
+  log_level: INFO
+
+# 自动交易设置。只在 OKX 模拟盘（demo）执行；实盘 profile 会被 credentials.py 直接拒绝。
+#
+# 杠杆与强平距离（满仓时，价格反向多少会被强平）：
+#   1x ~99%   2x ~49%   5x ~19%   10x ~9.5%   20x ~4.7%   50x ~2%
+# 选 10x 是因为你要 5% 容错：10x 的强平距离 9.5% 留有余量，
+# 而 20x 以上就低于 5% 了。注意 AAVE 满仓杠杆上限是 50x（不是 100x）。
+trading:
+  enabled: true
+  # 统一使用 OKX instId 格式。MU 永续 = MU-USDT-SWAP（不要写 MUUSDT，
+  # broker 的 to_ccxt_symbol 按 "-" 切分，写错会拼出不存在的市场）。
+  symbols: [BTC-USDT-SWAP, AAVE-USDT-SWAP, MU-USDT-SWAP]
+  # sizing_mode: fixed   -> 每笔固定 notional_usdt 名义价值
+  #              equity  -> 每笔为账户权益的 equity_pct%
+  sizing_mode: equity
+  notional_usdt: 100
+  equity_pct: 100       # 满仓
+  leverage: 10
+  stop_loss_pct: 3.0
+  max_total_notional: 100000   # 满仓模式下敞口随权益放大，上限相应放宽
+  position_mode: cross
