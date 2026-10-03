@@ -28,7 +28,7 @@ trading:
   enabled: true
   # 统一使用 OKX instId 格式。MU 永续 = MU-USDT-SWAP（不要写 MUUSDT，
   # broker 的 to_ccxt_symbol 按 "-" 切分，写错会拼出不存在的市场）。
-  symbols: [BTC-USDT-SWAP, AAVE-USDT-SWAP, MU-USDT-SWAP]
+  symbols: [BTC-USDT-SWAP, AAVE-USDT-SWAP, MU-USDT-SWAP, ZEC-USDT-SWAP]
   # sizing_mode: fixed   -> 每笔固定 notional_usdt 名义价值
   #              equity  -> 每笔为账户权益的 equity_pct%
   sizing_mode: equity

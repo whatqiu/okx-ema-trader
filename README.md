@@ -183,6 +183,12 @@ set PYTHONPATH=src
 .venv\Scripts\python.exe tests\test_executor.py
 .venv\Scripts\python.exe tests\test_console.py
 .venv\Scripts\python.exe tests\test_instruments.py
+.venv\Scripts\python.exe tests\test_platform_market.py
+.venv\Scripts\python.exe tests\test_platform_paper.py
+.venv\Scripts\python.exe tests\test_platform_autotrader.py
+.venv\Scripts\python.exe tests\test_platform_search.py
+.venv\Scripts\python.exe tests\test_platform_prune.py
+.venv\Scripts\python.exe tests\test_platform_poller.py
 ```
 
 - `test_indicators.py`：冻结了一份重构前的指标实现作为参照基准。
@@ -192,8 +198,35 @@ set PYTHONPATH=src
 - `test_console.py`：币种归一、config 单行改写保留注释、代理优先级、HTTP 路由（离线）。
 - `test_instruments.py`：ctVal 换算、`lotSz` 与 `minSz` 的区别、浮点不漂移、
   杠杆上限、`maxMktSz`、ccxt 符号映射、**回撤的单位**、限速器记账。
+- `test_platform_market.py`：平台行情层——confirm 标志位索引、成形K线的更正而非重复、
+  前向/后向缺口补拉、防死循环守卫、poller 容错。
+- `test_platform_paper.py`：模拟账户——双边手续费、保证金检查、强平价、
+  权益连续性（平仓瞬间跳变=平仓费）、重复平仓拒绝。
+- `test_platform_autotrader.py`：自动交易——与回测同源的信号评估、每根K线只评估一次、
+  反向先平后开、价格获取失败记录而不穿透。
+- `test_platform_search.py`：币种搜索——只留 USDT 永续、按**成交额**（量×价）排序防低价币霸榜、
+  5 分钟缓存、离线降级为本地币种清单。
+- `test_platform_prune.py`：数据保留——45 天K线窗口、**持仓永不删**、
+  日志表截断 keep-N、prune 幂等、VACUUM 后数据完整。
+- `test_platform_poller.py`：智能轮询——K线只在 bar 边界拉取、未确认重试、
+  ticker 内存热缓存 60s 节流落盘、stop() 冲刷缓存。
 
 全部离线，不联网、不需要 API Key。
+
+## 交易平台（`platform/`：Vue 3 前端 + FastAPI 后端 + SQLite 持久化）
+
+交易所式三栏界面（行情/图表/订单回测），数据本地永久储存，OKX 只补缺口。
+
+```bat
+start-platform.bat          rem 启动 http://127.0.0.1:8788
+```
+
+- **本地优先**：K线先读 `data/platform.db`，缺口才回源 OKX（后向 `after` 翻页补历史、
+  前向 `before` 翻页补停机空洞），20 req/2s 的限速预算由 `http.py` 统一掌管。
+- **成形K线**（confirm=0）也入库供图表显示，但回测/信号只读 `only_confirmed=True`。
+- **后台 poller**：每 5s 刷新最新K线+ticker，浏览器端只读本地库，不直接打 OKX。
+- 前端改动后需 `cd platform/frontend && npm run build`（或开发模式 `npm run dev`，
+  vite 代理 /api 到 8788）。API 文档在 `/docs`。
 
 ## K 线导出与画图（`fetch_mu_candles.py`）
 

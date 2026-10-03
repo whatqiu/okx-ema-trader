@@ -12,6 +12,13 @@ data/
 state.yaml
 *.log
 
+# Frontend — node_modules is tens of thousands of files and must never be
+# committed. dist/ IS tracked on purpose: it is ~110 KB of built assets and
+# keeping it in the repo means a fresh clone can start the platform without
+# running npm at all (start-platform.bat serves it directly).
+platform/frontend/node_modules/
+platform/frontend/.vite/
+
 # Local / machine-specific
 .claude/
 .mcp.json
