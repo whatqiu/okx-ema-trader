@@ -15,3 +15,10 @@
 *.yml  text eol=lf
 *.json text eol=lf
 *.toml text eol=lf
+
+# Frontend sources: LF in the working tree too. Without an explicit rule they
+# fall back to core.autocrlf (=true on Windows), so git keeps rewriting them
+# to CRLF and `git status` shows phantom modifications after every checkout.
+*.vue  text eol=lf
+*.js   text eol=lf
+*.css  text eol=lf
