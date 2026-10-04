@@ -14,7 +14,8 @@ const symbol = ref(localStorage.getItem('symbol') || 'MU')
 const bar = ref(localStorage.getItem('bar') || '5m')
 const rows = ref([])
 const ticker = ref(null)
-const signals = ref([])
+const signals = ref([])          // 当前图表币种（用于K线标记）
+const signalLog = ref([])        // 全部币种（看多/看空记录）
 const orders = ref([])
 const backtests = ref([])
 const stats = ref(null)
@@ -49,6 +50,8 @@ const btResult = ref(null)
 const auto = ref(null)
 const autoNotional = ref(100)
 const autoLeverage = ref(5)
+const autoMaxPositions = ref(3)
+const autoSymbolInput = ref('')
 const autoBusy = ref(false)
 
 // --- order history (own ref + filters, independent from chart markers) ------
@@ -164,6 +167,11 @@ function fmtUsdt(v) {
   return v == null ? '-' : (v < 0 ? '-' : '') + Math.abs(v).toFixed(2)
 }
 function fmtPct(v) { return v == null ? '-' : (v * 100).toFixed(2) + '%' }
+// `ZEC-USDT-SWAP` -> `ZEC`, so a multi-symbol record stays readable in a
+// narrow column without losing which instrument the call was made on.
+function shortInst(inst) {
+  return (inst || '').split('-')[0] || '-'
+}
 function fmtTime(ts) {
   if (!ts) return '-'
   const d = new Date(ts)
@@ -227,12 +235,16 @@ function mergeTickIntoCandle() {
 }
 async function loadPanels() {
   await guard(async () => {
-    const [s, o, b, st, eq, acc] = await Promise.all([
+    const [s, o, b, st, eq, acc, slog] = await Promise.all([
       api.signals(symbol.value, 50), api.orders({ symbol: symbol.value, limit: 50 }),
       api.backtests(symbol.value, 10), api.stats(),
       api.equity(300), api.account(),
+      // Unfiltered: the scanner watches several symbols, so a record limited to
+      // the chart's symbol would hide every call made on the others.
+      api.signals(null, 200),
     ])
     signals.value = s.rows
+    signalLog.value = slog.rows
     orders.value = o.rows
     backtests.value = b.rows
     stats.value = st
@@ -335,20 +347,57 @@ async function loadAuto() {
     auto.value = await api.autotrade()
     autoNotional.value = auto.value.notional
     autoLeverage.value = auto.value.leverage
+    autoMaxPositions.value = auto.value.max_positions ?? 3
   }, true)
+}
+function scanOf(inst) {
+  return auto.value?.scan?.[inst] || null
+}
+async function addAutoSymbol(raw) {
+  const name = (raw || '').trim()
+  if (!name) return
+  const current = [...(auto.value?.symbols || [])]
+  if (current.includes(name) || current.includes(name.toUpperCase())) {
+    flash('该币种已在监控列表中')
+    autoSymbolInput.value = ''
+    return
+  }
+  autoBusy.value = true
+  await guard(async () => {
+    auto.value = await api.setAutotrade({ symbols: [...current, name] })
+    autoSymbolInput.value = ''
+    flash(`已加入监控：${auto.value.symbols.join('、')}`)
+    await loadPanels()
+  })
+  autoBusy.value = false
+}
+async function removeAutoSymbol(inst) {
+  const rest = (auto.value?.symbols || []).filter(s => s !== inst)
+  autoBusy.value = true
+  await guard(async () => {
+    auto.value = await api.setAutotrade({ symbols: rest })
+    flash(`已移出监控：${inst}`)
+    await loadPanels()
+  })
+  autoBusy.value = false
 }
 async function toggleAutoTrade() {
   if (!auto.value) return
+  if (!auto.value.enabled && !(auto.value.symbols || []).length) {
+    flash('请先添加至少一个监控币种')
+    return
+  }
   autoBusy.value = true
   await guard(async () => {
     auto.value = await api.setAutotrade({
       enabled: !auto.value.enabled,
-      symbol: symbol.value,
+      symbols: auto.value.symbols,
       notional: Number(autoNotional.value),
       leverage: Number(autoLeverage.value),
+      max_positions: Number(autoMaxPositions.value),
     })
     flash(auto.value.enabled
-      ? `自动交易已开启：${auto.value.symbol} · 每根5m收盘评估信号`
+      ? `自动交易已开启：${auto.value.symbols.join('、')} · 每根5m收盘评估信号`
       : '自动交易已停止（已有持仓不会自动平仓）')
     await loadPanels()
   })
@@ -360,6 +409,7 @@ async function saveAutoParams() {
     auto.value = await api.setAutotrade({
       notional: Number(autoNotional.value),
       leverage: Number(autoLeverage.value),
+      max_positions: Number(autoMaxPositions.value),
     })
     flash('自动交易参数已保存')
   })
@@ -516,17 +566,24 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
           <div class="dim" v-else>等待行情…</div>
         </section>
         <section class="panel grow">
-          <h3>信号 <span class="dim">({{ signals.length }})</span></h3>
+          <h3>看多/看空记录 <span class="dim">({{ signalLog.length }})</span></h3>
           <div class="scroll">
-            <div v-for="s in signals" :key="s.id" class="row">
+            <div v-for="s in signalLog" :key="s.id" class="row sig-row">
               <span class="dim">{{ fmtTime(s.ts) }}</span>
               <b :class="s.side === 'short' ? 'down' : 'up'">
-                {{ s.side === 'short' ? '空' : (s.side === 'long' ? '多' : '—') }}
+                {{ s.side === 'short' ? '看空' : (s.side === 'long' ? '看多' : '—') }}
               </b>
+              <span class="sig-inst">{{ shortInst(s.inst_id) }}</span>
               <span>{{ fmtNum(s.price) }}</span>
+              <span class="dim">ADX {{ s.adx != null ? Number(s.adx).toFixed(1) : '—' }}</span>
+              <span :class="['sig-tag', s.acted ? 'ok' : 'no']">
+                {{ s.acted ? '已下单' : '未成交' }}
+              </span>
               <span class="dim reason">{{ s.reason }}</span>
             </div>
-            <div v-if="!signals.length" class="dim">暂无信号记录</div>
+            <div v-if="!signalLog.length" class="dim">
+              暂无记录 —— 自动交易每根 5m 收盘评估一次，有信号才会写入这里。
+            </div>
           </div>
         </section>
       </aside>
@@ -569,6 +626,26 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
               策略：15m 趋势 + ADX&gt;20 + 5m EMA20/60 交叉 · 每根 5m 收盘评估 ·
               无信号不操作
             </div>
+
+            <div class="auto-meta">监控币种</div>
+            <div class="watch-list">
+              <span v-for="inst in (auto?.symbols || [])" :key="inst" class="watch-chip">
+                <b>{{ shortInst(inst) }}</b>
+                <button :disabled="autoBusy" @click="removeAutoSymbol(inst)"
+                        :title="`从监控列表移除 ${inst}`">×</button>
+              </span>
+              <span v-if="!(auto?.symbols || []).length" class="dim">（未选择，请添加）</span>
+            </div>
+            <div class="watch-add">
+              <input v-model="autoSymbolInput" class="symbol-input"
+                     placeholder="如 BTC / ETH-USDT-SWAP"
+                     @keyup.enter="addAutoSymbol(autoSymbolInput)" />
+              <button class="btn" :disabled="autoBusy"
+                      @click="addAutoSymbol(autoSymbolInput)">添加</button>
+              <button class="btn" :disabled="autoBusy"
+                      @click="addAutoSymbol(symbol)">加当前</button>
+            </div>
+
             <div class="auto-params">
               <label>每笔 USDT
                 <input type="number" v-model.number="autoNotional" min="1" step="10"
@@ -578,7 +655,25 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
                 <input type="number" v-model.number="autoLeverage" min="1" max="20"
                        @change="saveAutoParams" />
               </label>
+              <label>最大持仓
+                <input type="number" v-model.number="autoMaxPositions" min="1" max="10"
+                       @change="saveAutoParams" />
+              </label>
             </div>
+
+            <div class="scan-table" v-if="(auto?.symbols || []).length">
+              <div v-for="inst in auto.symbols" :key="inst" class="scan-row">
+                <span>{{ shortInst(inst) }}</span>
+                <span :class="['hit', scanOf(inst)?.side === 'short' ? 'down' : 'up']">
+                  {{ scanOf(inst)?.side === 'short' ? '看空'
+                     : (scanOf(inst)?.side === 'long' ? '看多' : '—') }}
+                </span>
+                <span class="why" :title="scanOf(inst)?.why || ''">
+                  {{ scanOf(inst)?.why || '尚未评估' }}
+                </span>
+              </div>
+            </div>
+
             <div v-if="auto?.last_action" class="auto-meta">最近动作：{{ auto.last_action }}</div>
             <div v-if="auto?.last_error" class="auto-err">最近错误：{{ auto.last_error }}</div>
           </section>
@@ -928,6 +1023,35 @@ body {
 .auto-meta { font-size: 11px; margin-top: 6px; }
 .auto-err { font-size: 11px; margin-top: 6px; color: var(--down); }
 .auto-params { display: flex; gap: 8px; margin-top: 8px; }
+.watch-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.watch-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 6px; border-radius: 10px; font-size: 11px;
+  background: var(--bg-soft); border: 1px solid var(--border);
+}
+.watch-chip b { font-weight: 600; }
+.watch-chip button {
+  border: 0; background: transparent; cursor: pointer;
+  color: var(--dim); font-size: 12px; line-height: 1; padding: 0 1px;
+}
+.watch-chip button:hover { color: var(--down); }
+.watch-add { display: flex; gap: 5px; margin-top: 6px; }
+.watch-add input { flex: 1; min-width: 0; font-size: 11px; }
+.scan-table { margin-top: 8px; font-size: 11px; }
+.scan-row {
+  display: grid; grid-template-columns: 52px 34px 1fr;
+  gap: 6px; padding: 2px 0; align-items: baseline;
+  border-top: 1px solid var(--border);
+}
+.scan-row:first-child { border-top: 0; }
+.scan-row .why { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scan-row .hit { font-weight: 700; }
+.sig-row { display: flex; gap: 6px; align-items: baseline; flex-wrap: nowrap; }
+.sig-inst { min-width: 38px; font-weight: 600; }
+.sig-row .reason { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sig-tag { font-size: 10px; padding: 0 4px; border-radius: 6px; white-space: nowrap; }
+.sig-tag.ok { background: rgba(14, 203, 129, .14); color: var(--up); }
+.sig-tag.no { background: rgba(246, 70, 93, .12); color: var(--down); }
 .auto-params label { display: flex; flex-direction: column; gap: 3px; color: var(--dim); font-size: 11px; }
 .auto-params input {
   background: var(--bg); border: 1px solid var(--border); color: var(--text);

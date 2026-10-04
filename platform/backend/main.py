@@ -101,7 +101,7 @@ def _run_risk_check(store) -> dict:
 
 
 def _auto_loop() -> None:
-    """Every 15s: enforce risk, then evaluate the newest confirmed bar.
+    """Every 15s: enforce risk, then scan every watched symbol for a signal.
 
     The loop never dies: a proxy outage or a bad tick must not end auto-trading
     for the session. But it is no longer silent — every pass records success or
@@ -113,21 +113,18 @@ def _auto_loop() -> None:
         try:
             store = deps.store()
             state = autotrader.get_state(store)
-            inst = deps.normalise_symbol(state["symbol"]) if state["symbol"] else ""
-            if not state["enabled"] or not inst:
+            symbols = state["symbols"]
+            if not state["enabled"] or not symbols:
                 # Nothing to trade, so this pass dialled out to nobody. Record
                 # the loop as alive but do NOT claim a successful contact:
                 # `idle()` leaves `last_ok_at` alone so a real outage still
                 # shows up in the badge while auto-trading is off.
                 _auto_health.idle()
                 continue
-            cfg = deps.config()
             # The brake does not care whether the strategy is switched on: an
             # open position left unattended is exactly the case it exists for.
             _run_risk_check(store)
-            market.ensure_candles(store, inst, cfg.bar_5m, 400)
-            market.ensure_candles(store, inst, cfg.bar_15m, 200)
-            autotrader.maybe_trade(store, inst)
+            autotrader.maybe_trade_all(store)
             _auto_health.ok()
         except Exception as exc:
             # Recorded, not swallowed. The previous `except Exception: continue`
@@ -156,6 +153,14 @@ async def lifespan(app: FastAPI):
     global _poller
     _poller = market.MarketPoller(deps.store(), interval=5.0)
     _poller.start()
+    # Re-subscribe on boot. The watch list lives in the database; the poller's
+    # watch set does not. Without this a restart resurrects auto-trading with a
+    # watch list nobody is refreshing, and the scan quietly trades on candles
+    # that stop moving.
+    _boot_cfg = deps.config()
+    for _inst in autotrader.get_state(deps.store())["symbols"]:
+        _poller.watch(_inst, _boot_cfg.bar_5m)
+        _poller.watch(_inst, _boot_cfg.bar_15m)
     _auto_stop.clear()
     _janitor_stop.clear()
     auto_thread = threading.Thread(target=_auto_loop, daemon=True,
@@ -359,8 +364,12 @@ def admin_prune():
 class AutoTradePatch(BaseModel):
     enabled: bool | None = None
     symbol: str | None = None
+    # The watch list. A single `symbol` is still accepted and replaces it, so an
+    # older client keeps working — it just trades one thing.
+    symbols: list[str] | None = None
     notional: float | None = Field(None, gt=0)
     leverage: float | None = Field(None, ge=1.0, le=20.0)
+    max_positions: int | None = Field(None, ge=1, le=autotrader.MAX_SYMBOLS)
 
 
 @app.get("/api/autotrade")
@@ -374,18 +383,24 @@ def autotrade_set(patch: AutoTradePatch):
     fields = patch.model_dump(exclude_none=True)
     if "symbol" in fields:
         fields["symbol"] = _symbol(fields["symbol"])
+    if "symbols" in fields:
+        fields["symbols"] = [_symbol(s) for s in fields["symbols"] or []]
     try:
         state = autotrader.set_state(store, **fields)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    # Turning it on must not wait 15s for the first evaluation: trade now.
-    if patch.enabled and state["symbol"]:
-        inst = deps.normalise_symbol(state["symbol"])
+    # Turning it on must not wait 15s for the first evaluation: scan now.
+    if patch.enabled and state["symbols"]:
         cfg = deps.config()
-        _okx(lambda: market.ensure_candles(store, inst, cfg.bar_5m, 400))
-        _okx(lambda: market.ensure_candles(store, inst, cfg.bar_15m, 200))
-        _watch(inst, cfg.bar_5m)
-        autotrader.maybe_trade(store, inst)
+        for inst in state["symbols"]:
+            # Backfill once, then let the poller keep it fresh at bar
+            # boundaries. Watching is what stops the scan from re-fetching
+            # history every 15 seconds for every symbol.
+            _okx(lambda i=inst: market.ensure_candles(store, i, cfg.bar_5m, 400))
+            _okx(lambda i=inst: market.ensure_candles(store, i, cfg.bar_15m, 200))
+            _watch(inst, cfg.bar_5m)
+            _watch(inst, cfg.bar_15m)
+        autotrader.maybe_trade_all(store)
         state = autotrader.get_state(store)
     return _json_safe(state)
 
