@@ -115,7 +115,11 @@ def _auto_loop() -> None:
             state = autotrader.get_state(store)
             inst = deps.normalise_symbol(state["symbol"]) if state["symbol"] else ""
             if not state["enabled"] or not inst:
-                _auto_health.ok()
+                # Nothing to trade, so this pass dialled out to nobody. Record
+                # the loop as alive but do NOT claim a successful contact:
+                # `idle()` leaves `last_ok_at` alone so a real outage still
+                # shows up in the badge while auto-trading is off.
+                _auto_health.idle()
                 continue
             cfg = deps.config()
             # The brake does not care whether the strategy is switched on: an
@@ -439,8 +443,11 @@ def _exit_prices(store) -> dict[str, tuple]:
 def health_status():
     """Is the system actually alive? Two independent monitors plus the brake.
 
-    `connected` is the AND of both loops: if either cannot reach OKX the data on
-    screen is incomplete, and a single green light would be a lie.
+    `connected` = the watchdog proves OKX answers AND the auto loop is not in
+    error. It is deliberately NOT `market.connected and auto.connected`: the
+    auto loop goes idle (no request at all) whenever auto-trading is off, and an
+    idle loop has no `last_ok_at` to offer. Using `loop_alive` there keeps the
+    light green when the switch is simply off, and red when the loop is broken.
 
     Deliberately NOT /api/health: that endpoint means "this process is serving"
     and is what desktop.py probes for a live port. Folding upstream connectivity
@@ -450,7 +457,7 @@ def health_status():
     store = deps.store()
     market_h = _market_health.snapshot()
     auto_h = _auto_health.snapshot()
-    connected = bool(market_h["connected"] and auto_h["connected"])
+    connected = bool(market_h["connected"] and auto_h["loop_alive"])
     return _json_safe({
         "connected": connected,
         "market": market_h,

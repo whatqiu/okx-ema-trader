@@ -52,10 +52,29 @@ class HealthState:
     failures: int = 0             # consecutive failures
     polls: int = 0
     now_ms: int = 0
+    # True when the loop is alive but did NOT touch the network this pass
+    # (auto-trading switched off). It must never be reported as connectivity.
+    idle: bool = False
 
     @property
     def connected(self) -> bool:
-        return self.last_ok_at > 0 and self.error_since == 0
+        """We have positive proof that OKX answered, and nothing says otherwise.
+
+        An idle loop is excluded on purpose: it made no request, so it has no
+        evidence either way. Reporting `True` there would resurrect an old
+        timestamp and paint a green badge over a live outage.
+        """
+        return self.last_ok_at > 0 and self.error_since == 0 and not self.idle
+
+    @property
+    def loop_alive(self) -> bool:
+        """The loop itself is healthy — idle counts, an error does not.
+
+        This, not `connected`, is what a mixed-health badge should AND together:
+        a loop that is parked by design must not drag the light red, but a loop
+        that is throwing must.
+        """
+        return self.error_since == 0
 
     def offline_for_s(self, now_ms: int | None = None) -> int:
         if not self.error_since:
@@ -73,6 +92,8 @@ class HealthState:
             "last_error": self.last_error,
             "failures": self.failures,
             "polls": self.polls,
+            "idle": self.idle,
+            "loop_alive": self.loop_alive,
         }
 
 
@@ -97,9 +118,31 @@ class HealthMonitor:
             s.last_error = ""
             s.error_since = 0
             s.polls += 1
+            s.idle = False
             # The newest moment we know for a fact that OKX answered. Freshness
             # is what the badge promises, so a success always moves it forward.
             s.last_ok_at = now
+            s.now_ms = now
+
+    def idle(self) -> None:
+        """The loop ran, but made no request — it has nothing to report.
+
+        Used when auto-trading is switched off. Crucially this does NOT touch
+        `last_ok_at`: stamping "OKX answered at <now>" for a pass that never
+        dialled out would make the badge green during an outage.
+
+        It DOES clear the error state, though — switching auto-trading off is a
+        legitimate way to stop this loop from being the one that is red. The
+        watchdog still probes unconditionally, so a dead proxy stays visible.
+        """
+        with self._lock:
+            now = self._clock()
+            s = self._state
+            s.failures = 0
+            s.last_error = ""
+            s.error_since = 0
+            s.polls += 1
+            s.idle = True
             s.now_ms = now
 
     def fail(self, reason: str) -> None:
@@ -108,6 +151,7 @@ class HealthMonitor:
             s = self._state
             s.polls += 1
             s.failures += 1
+            s.idle = False
             s.last_error = str(reason)[:300]
             if not s.error_since:
                 s.error_since = now

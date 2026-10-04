@@ -130,6 +130,71 @@ def test_health_reason_is_preserved_not_swallowed():
     check("缺少买一" in snap["last_error"], "the actual reason survives")
 
 
+def test_idle_does_not_claim_a_successful_contact():
+    """Regression: auto-trading OFF used to call `ok()`, faking a green badge.
+
+    An idle pass never dialled out, so it must not move `last_ok_at` — otherwise
+    the UI shows "已连接" during a real outage whenever the switch is off.
+    """
+    clock = fake_clock()
+    mon = health.HealthMonitor(clock)
+    mon.ok()
+    good_at = mon.snapshot()["last_ok_at"]
+    clock.advance(30)
+    mon.idle()
+    snap = mon.snapshot()
+    check(snap["idle"] is True, "an idle pass is flagged as idle")
+    check(snap["last_ok_at"] == good_at,
+          "idle must not advance last_ok_at — no request was made")
+    check(snap["loop_alive"] is True, "the loop itself is fine")
+    check(not snap["connected"],
+          "an idle loop must not claim connectivity off a stale timestamp")
+
+
+def test_idle_from_cold_start_is_not_connected():
+    """Idle with no prior success proves nothing, so it must not say 'connected'."""
+    clock = fake_clock()
+    mon = health.HealthMonitor(clock)
+    mon.idle()
+    snap = mon.snapshot()
+    check(snap["loop_alive"] is True, "idle is not an error")
+    check(not snap["connected"],
+          "idle alone must never be reported as connectivity")
+    check(snap["last_ok_at"] == 0, "no contact was ever made")
+
+
+def test_idle_resets_the_error_streak_without_claiming_connectivity():
+    """Switching auto-trading off is not a fix for a broken proxy.
+
+    `idle()` does clear `error_since` — a parked loop must not stay red forever
+    — but it still refuses to report `connected`, because no request was made.
+    The watchdog is what decides the badge during an outage.
+    """
+    clock = fake_clock()
+    mon = health.HealthMonitor(clock)
+    mon.ok()
+    mon.fail("WinError 10061")
+    clock.advance(20)
+    mon.idle()
+    snap = mon.snapshot()
+    check(snap["failures"] == 0, "idle is a clean pass, so the streak resets")
+    check(snap["last_error"] == "", "no error to show while idle")
+    check(not snap["connected"],
+          "going idle must not silently turn a red badge green")
+
+
+def test_ok_and_fail_clear_the_idle_flag():
+    clock = fake_clock()
+    mon = health.HealthMonitor(clock)
+    mon.idle()
+    check(mon.snapshot()["idle"] is True, "idle set")
+    mon.ok()
+    check(mon.snapshot()["idle"] is False, "a real success clears idle")
+    mon.idle()
+    mon.fail("boom")
+    check(mon.snapshot()["idle"] is False, "a failure clears idle")
+
+
 # --------------------------------------------------------------------------
 # Circuit breaker — pure decision logic
 # --------------------------------------------------------------------------
