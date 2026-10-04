@@ -56,6 +56,57 @@ const historyOrders = ref([])
 const ordStatus = ref('')
 const ordOnlyCurrent = ref(false)
 
+// --- liveness + circuit breaker -------------------------------------------
+// The backend owns the truth about whether OKX is reachable; this only renders
+// it. `wasOffline` exists so the banner can announce the recovery instead of
+// silently vanishing, which is what makes an outage feel like a glitch.
+const status = ref(null)
+const wasOffline = ref(false)
+const riskToast = ref('')
+
+const connOk = computed(() => !!status.value?.connected)
+const offlineFor = computed(() => status.value?.market?.offline_for_s ?? 0)
+const losingStreak = computed(() => status.value?.risk?.losing_streak ?? 0)
+const riskActive = computed(() => !!status.value?.risk?.limits?.enabled)
+
+function fmtDuration(seconds) {
+  const s = Math.max(0, Math.floor(seconds || 0))
+  if (s < 60) return `${s}秒`
+  if (s < 3600) return `${Math.floor(s / 60)}分${s % 60}秒`
+  return `${Math.floor(s / 3600)}小时${Math.floor((s % 3600) / 60)}分`
+}
+
+function lastOkText() {
+  const at = status.value?.market?.last_ok_at
+  if (!at) return '尚未成功连接'
+  return new Date(at).toLocaleTimeString('zh-CN', { hour12: false })
+}
+
+async function loadStatus() {
+  try {
+    const s = await api.status()
+    const was = status.value?.connected
+    status.value = s
+    if (was === true && !s.connected) wasOffline.value = true
+    if (s.connected && wasOffline.value) {
+      wasOffline.value = false
+      notice.value = '网络已恢复'
+      setTimeout(() => (notice.value = ''), 3000)
+    }
+    // A risk close that happened in the background is the single most important
+    // thing this panel can tell you — a position died while you were away.
+    const closed = s?.risk?.last?.closed || []
+    if (closed.length) {
+      const last = closed[closed.length - 1]
+      riskToast.value = `风控平仓：${last.reason}`
+    }
+  } catch {
+    // Backend itself unreachable. Leave the previous state alone so the badge
+    // does not flip to a false "offline from OKX" — the process is the problem.
+    status.value = null
+  }
+}
+
 const orderSummary = computed(() => {
   const closed = historyOrders.value.filter(o => o.pnl != null)
   const total = closed.reduce((s, o) => s + o.pnl, 0)
@@ -342,12 +393,19 @@ function setupTimers() {
     setInterval(() => loadCandles(false), 5000),
     setInterval(loadTicker, 3000),
     setInterval(loadPanels, 10000),
-  ] : []
+    // Liveness is deliberately NOT tied to the auto-refresh switch. Turning
+    // refresh off means "stop asking the market for candles", but the one thing
+    // you still need to know is whether the connection died while you were away.
+    setInterval(loadStatus, 4000),
+  ] : [
+    setInterval(loadStatus, 4000),
+  ]
 }
 
 onMounted(async () => {
   await applySymbol()
   await Promise.all([loadSettings(), loadAuto()])
+  await loadStatus()
   setupTimers()
 })
 onBeforeUnmount(() => timers.forEach(clearInterval))
@@ -379,6 +437,19 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
         <span class="dim">量 {{ fmtNum(ticker.vol24h, 0) }}</span>
       </div>
       <div class="topbar-right">
+        <span class="conn-badge" v-if="status"
+              :class="connOk ? 'ok' : 'bad'"
+              :title="connOk
+                ? `已连接 OKX，最后成功 ${lastOkText()}`
+                : `断网 ${fmtDuration(offlineFor)}｜最后成功 ${lastOkText()}｜${status.market?.last_error || status.auto?.last_error || '未知原因'}`">
+          <span class="dot"></span>
+          {{ connOk ? '已连接' : '断网' + fmtDuration(offlineFor) }}
+        </span>
+        <span class="conn-badge" v-if="status && riskActive"
+              :class="losingStreak > 0 ? 'warn' : 'muted'"
+              :title="`风控：单仓浮亏 >${status.risk.limits.max_loss_pct}% 强平｜账户回撤 >${status.risk.limits.max_daily_loss_pct}% 强平｜连亏 ${status.risk.limits.max_consecutive_losses} 次停手`">
+          风控 {{ losingStreak > 0 ? `连亏${losingStreak}` : '启用' }}
+        </span>
         <button class="btn ghost" :class="{ on: autoRefresh }" @click="toggleAuto"
                 :title="autoRefresh ? '自动刷新：开' : '自动刷新：关'">
           {{ autoRefresh ? '⟳ 自动' : '⏸ 手动' }}
@@ -387,6 +458,16 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
         <button class="btn ghost" @click="showSettings = !showSettings">⚙</button>
       </div>
     </header>
+
+    <!-- An outage must never look like a quiet market: say it out loud, with a
+         duration and a cause, for as long as it lasts. -->
+    <div v-if="status && !connOk" class="offline-banner">
+      <strong>已与 OKX 断线 {{ fmtDuration(offlineFor) }}</strong>
+      <span>最后成功连接：{{ lastOkText() }}</span>
+      <span class="dim">{{ status.market?.last_error || status.auto?.last_error || '原因未知' }}</span>
+      <span class="dim">断线期间无法获取实时价格，浮亏按开仓价估算；恢复后风控会立即重新判定。</span>
+    </div>
+    <div v-if="riskToast" class="risk-banner">{{ riskToast }}</div>
 
     <div v-if="showSettings" class="settings-bar">
       <span class="dim">代理（当前生效: {{ resolvedProxy }}）</span>
@@ -673,6 +754,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
   --dim: #848e9c;
   --up: #0ecb81;
   --down: #f6465d;
+  --warn: #f0b90b;
   --accent: #f0b90b;
 }
 * { box-sizing: border-box; }
@@ -731,6 +813,40 @@ body {
 }
 .notice-banner {
   background: rgba(14, 203, 129, 0.12); color: var(--up);
+  padding: 6px 14px; border-bottom: 1px solid var(--border);
+}
+
+/* Liveness badge. Colour alone would not do: a red dot and a green dot are the
+   same shape, so the label carries the state and the dot only reinforces it. */
+.conn-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 8px; border-radius: 3px; font-size: 12px;
+  border: 1px solid var(--border); color: var(--dim);
+  white-space: nowrap; cursor: default;
+}
+.conn-badge .dot {
+  width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+  flex: 0 0 auto;
+}
+.conn-badge.ok { color: var(--up); border-color: rgba(14, 203, 129, 0.4); }
+.conn-badge.bad {
+  color: var(--down); border-color: var(--down);
+  background: rgba(246, 70, 93, 0.12);
+}
+/* A losing streak is not a failure state — it is a caution. */
+.conn-badge.warn { color: var(--warn); border-color: rgba(240, 185, 11, 0.5); }
+.conn-badge.muted { color: var(--dim); }
+
+.offline-banner {
+  display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  background: rgba(246, 70, 93, 0.15); color: var(--down);
+  padding: 7px 14px; border-bottom: 1px solid var(--border);
+}
+.offline-banner strong { font-weight: 600; }
+.offline-banner .dim { color: var(--dim); font-size: 12px; }
+
+.risk-banner {
+  background: rgba(240, 185, 11, 0.14); color: var(--warn);
   padding: 6px 14px; border-bottom: 1px solid var(--border);
 }
 

@@ -40,6 +40,14 @@ def _fee(notional: float) -> float:
     return notional * TAKER_FEE_BPS / 10_000.0
 
 
+def _f(value) -> float | None:
+    """OKX sends numbers as strings; tolerate a missing/blank one."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def open_position(store, inst_id: str, side: str, notional: float,
                   leverage: float, price: float) -> dict:
     """Open a paper position at `price` (caller passes real bid/ask).
@@ -112,12 +120,17 @@ def liquidation_price(order: dict) -> float:
     return order["entry_price"] * (1 + 1 / lev)
 
 
-def account_summary(store, marks: dict[str, float] | None = None) -> dict:
+def account_summary(store, marks: dict[str, float] | None = None,
+                    exit_prices: dict[str, tuple] | None = None) -> dict:
     """balance / equity / margin / available, plus open positions marked to
-    `marks` (inst_id -> last price). Missing marks use the entry price, which
-    understates nothing and overstates nothing — it just means "no price yet".
+    `marks` (inst_id -> last price). `exit_prices` supplies (bid, ask) so a risk
+    close can cross the spread instead of filling at the mark.
+
+    Missing marks use the entry price, which understates nothing and overstates
+    nothing — it just means "no price yet".
     """
     marks = marks or {}
+    exit_prices = exit_prices or {}
     orders = store.orders(limit=1000)
     realised = sum(o["pnl"] for o in orders
                    if o["status"] == "closed" and o["pnl"] is not None)
@@ -138,6 +151,10 @@ def account_summary(store, marks: dict[str, float] | None = None) -> dict:
             "unrealised_pnl": upl,
             "margin": margin,
             "liq_price": liquidation_price(o),
+            # The exit side, so a risk close can cross the spread honestly
+            # instead of pretending the mark price is fillable.
+            "bid": _f(exit_prices.get(o["inst_id"], (None, None))[0]),
+            "ask": _f(exit_prices.get(o["inst_id"], (None, None))[1]),
         })
     equity = balance + unrealised
     return {

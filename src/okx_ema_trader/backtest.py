@@ -494,6 +494,73 @@ def main() -> None:
     verdict = "edge survives realistic costs" if report.net_return > 0 else "NO EDGE — costs eat everything"
     print(f"  verdict           : {verdict}")
 
+    # ---- READ THE VERDICT WITH CARE ------------------------------------
+    # `net_return > 0` is a SIGN test, not a proof. It answers "did this exact
+    # 30-day window happen to come out positive", which is a much weaker claim
+    # than "this strategy has an edge".
+    #
+    # Sample size is the thing that is quietly missing from the verdict above.
+    # Rules of thumb for a directional intraday strategy:
+    #     < 30 trades  : noise. A profitable run is luck, full stop.
+    #    30-100 trades : suggestive, not conclusive.
+    #   100-300 trades: worth acting on.
+    #        300+     : the only number you can size real money with.
+    #
+    # The 30-day MU run produced 14 trades, 8 of them stops. Whatever that
+    # window says, it cannot establish the absence of an edge — only that
+    # 14 trades were not enough to demonstrate one. And note the asymmetry
+    # that makes this dangerous: with 14 trades you can ALSO tune a parameter
+    # until the backtest goes green. That is overfitting, not discovery.
+    #
+    # breakeven_bps is the more honest number, because it is independent of
+    # the sample size. Read it in three tiers:
+    #     strongly positive  -> real edge, comfortably above costs
+    #     small positive     -> edge exists but is thinner than your costs
+    #     NEGATIVE           -> the gross PnL is itself negative. The direction
+    #                           is wrong. No fee reduction can fix this; only
+    #                           changing the logic can.
+    n = len(report.trades)
+    if report.net_return > 0 and n < 30:
+        print(f"  ⚠ WARNING        : 只有 {n} 笔交易（<30）。正收益在这个样本量下")
+        print(f"                     可能是运气而非 edge，不能据此判断策略有效。")
+    if report.breakeven_bps < 0:
+        print(f"  ⚠ 诊断           : breakeven 为负 ({report.breakeven_bps:.1f} bps)，")
+        print(f"                     说明毛利本身是负的 —— 不是被手续费吃掉，是方向错了。")
+        print(f"                     降费用救不了，只能改逻辑。")
+    elif 0 <= report.breakeven_bps < 20:
+        print(f"  ⚠ 诊断           : breakeven 仅 {report.breakeven_bps:.1f} bps，edge 很薄，")
+        print(f"                     略高的手续费或滑点就会把它吃掉。")
+
+    # ---- WHERE THE LOSSES ACTUALLY COME FROM ----------------------------
+    # "NO EDGE" is a summary, and summaries hide structure. Count the exit
+    # reasons before concluding the DIRECTION is wrong.
+    #
+    # The MU 30-day run (14 trades, 3 wins / 11 losses) is the example to read
+    # carefully, because the aggregate verdict is misleading:
+    #
+    #     average WIN   +6.14%      <- substantial; the signal finds real trends
+    #     average LOSS  -2.31%      <- small; capped by a 3% stop
+    #     payoff ratio   0.72       <- 3/14 wins is too low to pay for that
+    #
+    # 8 of the 11 losses printed exactly -3.00%: they did not lose because the
+    # thesis was wrong, they were taken out at the stop while the thesis was
+    # still working. A 3% stop on a 5m EMA crossover sits INSIDE normal
+    # intrabar noise — the question is not "is the stop profitable" but "is the
+    # stop wider than the noise the entry needs to clear".
+    #
+    # So the first thing to test is the stop, not the signal. Widening the stop
+    # trades one known cost (more losses) against an unmeasured one (whether the
+    # moves that stop currently eats would have continued in your favour).
+    # Counting the exits is how you tell those two apart; net PnL cannot.
+    if report.trades:
+        stops = [t for t in report.trades if t.exit_reason == "stop"]
+        if stops:
+            share = len(stops) / len(report.trades)
+            tag = "  <- 多数亏损来自止损，方向未必是主因" if share > 0.4 else ""
+            print(f"  止损占比         : {len(stops)}/{len(report.trades)} ({share:.0%}){tag}")
+            if share > 0.4:
+                print(f"                     先怀疑止损宽度，再怀疑信号方向。")
+
     print_trades(report.trades, args.show_trades)
     print("")
     print("  Note: a signal is decided on bar N's close and filled at bar N+1's open.")

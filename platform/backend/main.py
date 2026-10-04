@@ -24,6 +24,7 @@ import deps
 import market
 import paper
 import autotrader
+import health
 from okx_ema_trader.backtest import MINUTES_PER_BAR, simulate
 from okx_ema_trader.console_server import _json_safe
 from okx_ema_trader.http import OkxError
@@ -34,6 +35,29 @@ _auto_stop = threading.Event()
 _janitor_stop = threading.Event()
 _prune_lock = threading.Lock()
 JANITOR_INTERVAL_S = 6 * 3600
+
+# Liveness + circuit breaker. One monitor per loop so a dead poller cannot hide
+# behind a healthy trader, and one shared risk report for the UI.
+_market_health = health.HealthMonitor()
+_auto_health = health.HealthMonitor()
+_risk_lock = threading.Lock()          # only one thread may close a position
+_last_risk: dict = {}                  # most recent enforce_risk() report
+
+RISK_LIMITS = health.RiskLimits(
+    enabled=True,
+    # 60% of the position's own margin. At 5x that is a ~12% adverse move, well
+    # before the 20% liq distance; a tighter cap would turn ordinary noise into
+    # forced exits, which is how a strategy loses money on its own brake.
+    max_loss_pct=60.0,
+    # 25% of the account. A day that erases a quarter of the balance means
+    # something is structurally wrong, not that the market is hard.
+    max_daily_loss_pct=25.0,
+    # Five losses in a row: stop letting the strategy open new risk.
+    max_consecutive_losses=5,
+    # Exit when the mark is within 3% of the liq price. At 5x that is well
+    # outside the 20% liq distance, so this is a brake, not a coin flip.
+    liq_buffer_pct=3.0,
+)
 
 
 def _prune_safe() -> dict | None:
@@ -56,27 +80,71 @@ def _janitor_loop() -> None:
         _prune_safe()
 
 
-def _auto_loop() -> None:
-    """Every 15s: if auto-trading is on, evaluate the newest confirmed bar.
+def _run_risk_check(store) -> dict:
+    """Enforce the circuit breaker. Runs on EVERY auto-loop pass.
 
-    The loop never raises: a proxy outage or a bad tick must not kill
-    auto-trading for the rest of the session — the next pass may succeed.
+    Order matters: the breaker goes first, before the strategy gets to open new
+    risk. A strategy that opens first and stops second spends one more bar
+    exposed on every loop that needs rescuing.
+
+    The lock is what makes this safe to call from both the background loop and
+    the manual /api/risk/check route: two threads closing the same order would
+    race on the balance check and one would raise "position does not exist".
+    """
+    global _last_risk
+    with _risk_lock:
+        report = health.enforce_risk(store, limits=RISK_LIMITS,
+                                     marks=_marks(store),
+                                     exit_prices=_exit_prices(store))
+        _last_risk = report
+    return report
+
+
+def _auto_loop() -> None:
+    """Every 15s: enforce risk, then evaluate the newest confirmed bar.
+
+    The loop never dies: a proxy outage or a bad tick must not end auto-trading
+    for the session. But it is no longer silent — every pass records success or
+    the reason it failed, so a three-hour outage shows up in the UI instead of
+    looking like an idle market.
     """
     while not _auto_stop.wait(15.0):
+        store = None
         try:
             store = deps.store()
             state = autotrader.get_state(store)
-            if not state["enabled"] or not state["symbol"]:
-                continue
-            inst = deps.normalise_symbol(state["symbol"])
-            if not inst:
+            inst = deps.normalise_symbol(state["symbol"]) if state["symbol"] else ""
+            if not state["enabled"] or not inst:
+                _auto_health.ok()
                 continue
             cfg = deps.config()
+            # The brake does not care whether the strategy is switched on: an
+            # open position left unattended is exactly the case it exists for.
+            _run_risk_check(store)
             market.ensure_candles(store, inst, cfg.bar_5m, 400)
             market.ensure_candles(store, inst, cfg.bar_15m, 200)
             autotrader.maybe_trade(store, inst)
-        except Exception:
-            continue
+            _auto_health.ok()
+        except Exception as exc:
+            # Recorded, not swallowed. The previous `except Exception: continue`
+            # kept the loop alive but erased the reason, which made an outage
+            # indistinguishable from a quiet market.
+            _auto_health.fail(f"{type(exc).__name__}: {exc}")
+
+
+def _watchdog_loop() -> None:
+    """Every 5s: prove OKX is still reachable, and mirror that into the ticker.
+
+    The poller already retries, but it only touches watched symbols; if the
+    watch list is empty (nobody opened the chart) it would report "healthy" all
+    day while the network was down. This asks OKX directly.
+    """
+    while not _auto_stop.wait(5.0):
+        try:
+            deps.okx_get("/public/time")
+            _market_health.ok()
+        except Exception as exc:
+            _market_health.fail(f"{type(exc).__name__}: {exc}")
 
 
 @asynccontextmanager
@@ -89,6 +157,9 @@ async def lifespan(app: FastAPI):
     auto_thread = threading.Thread(target=_auto_loop, daemon=True,
                                    name="auto-trader")
     auto_thread.start()
+    watchdog = threading.Thread(target=_watchdog_loop, daemon=True,
+                                name="okx-watchdog")
+    watchdog.start()
     janitor_thread = threading.Thread(target=_janitor_loop, daemon=True,
                                       name="db-janitor")
     janitor_thread.start()
@@ -143,7 +214,19 @@ def _watch(symbol: str, bar: str) -> None:
 # Market data
 # --------------------------------------------------------------------------
 @app.get("/api/health")
-def health():
+def health_liveness():
+    """Liveness only: "this process is serving". Never reflects upstream state.
+
+    Named `_liveness` rather than `health` on purpose: a module-level
+    `def health()` shadows the `health` MODULE for the whole file, and the
+    failure mode is an AttributeError on `health.enforce_risk` that no offline
+    test can see because they import `health` directly, never `main`.
+
+    desktop.py uses a 200 here to decide whether an instance already exists.
+    If this endpoint turned red on a proxy outage, closing the window would make
+    it spawn a second server on top of a healthy one. Upstream connectivity
+    lives at /api/status.
+    """
     return {
         "ok": True,
         "time": int(time.time() * 1000),
@@ -329,10 +412,75 @@ def _marks(store) -> dict[str, float]:
     return marks
 
 
+def _exit_prices(store) -> dict[str, tuple]:
+    """inst_id -> (bid, ask) for every symbol with an open position.
+
+    Same lookup order as `_marks` (hot cache -> persisted tick -> OKX), but keeps
+    both sides so a risk close can cross the spread instead of filling at the
+    mid. Without this, an emergency stop would realise a worse price than the
+    one the stop was computed from.
+    """
+    prices: dict[str, tuple] = {}
+    for o in store.open_orders():
+        inst = o["inst_id"]
+        if inst in prices:
+            continue
+        tick = _poller.latest_ticker(inst) if _poller else store.tick(inst)
+        if not tick or not (tick.get("bid") and tick.get("ask")):
+            try:
+                tick = market.fetch_ticker(store, inst)
+            except OkxError:
+                tick = None
+        prices[inst] = ((tick or {}).get("bid"), (tick or {}).get("ask"))
+    return prices
+
+
+@app.get("/api/status")
+def health_status():
+    """Is the system actually alive? Two independent monitors plus the brake.
+
+    `connected` is the AND of both loops: if either cannot reach OKX the data on
+    screen is incomplete, and a single green light would be a lie.
+
+    Deliberately NOT /api/health: that endpoint means "this process is serving"
+    and is what desktop.py probes for a live port. Folding upstream connectivity
+    in would make the desktop shell relaunch a perfectly healthy server just
+    because the proxy is down.
+    """
+    store = deps.store()
+    market_h = _market_health.snapshot()
+    auto_h = _auto_health.snapshot()
+    connected = bool(market_h["connected"] and auto_h["connected"])
+    return _json_safe({
+        "connected": connected,
+        "market": market_h,
+        "auto": auto_h,
+        "risk": {
+            "limits": {
+                "enabled": RISK_LIMITS.enabled,
+                "max_loss_pct": RISK_LIMITS.max_loss_pct,
+                "max_daily_loss_pct": RISK_LIMITS.max_daily_loss_pct,
+                "max_consecutive_losses": RISK_LIMITS.max_consecutive_losses,
+                "liq_buffer_pct": RISK_LIMITS.liq_buffer_pct,
+            },
+            "last": _last_risk,
+            "losing_streak": health.consecutive_losses(store),
+        },
+    })
+
+
+@app.post("/api/risk/check")
+def risk_check():
+    """Run the circuit breaker now, on demand. Same path the loop uses."""
+    report = _run_risk_check(deps.store())
+    return _json_safe(report)
+
+
 @app.get("/api/account")
 def account():
     store = deps.store()
-    return _json_safe(paper.account_summary(store, _marks(store)))
+    return _json_safe(paper.account_summary(store, _marks(store),
+                                             _exit_prices(store)))
 
 
 class TradeOpenRequest(BaseModel):

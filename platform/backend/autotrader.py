@@ -84,6 +84,11 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
 
     last_ts = int(rows5[-1][0])
     last_done = int(store.get_meta("auto_last_bar_ts", "0"))
+    # Exactly-once evaluation per bar. A bar ts is a natural dedup key: it is
+    # stamped in meta BEFORE the trade, so even a crash between the trade and
+    # the next poll cannot re-fire the same crossover. That is the trade-off —
+    # a crash can skip a bar, but the far worse failure is opening the same
+    # position twice, which the old restart-while-long state had.
     if last_ts <= last_done:
         return {"acted": False, "why": "bar already evaluated", "bar_ts": last_ts}
     _record(store, "auto_last_bar_ts", str(last_ts))
@@ -93,6 +98,18 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
 
     # 15m filter: the last 15m bar CLOSED at the 5m close, never the forming
     # one. Same cutoff arithmetic as backtest.simulate.
+    #
+    # The arithmetic, spelled out because this is where look-ahead bugs live:
+    #   last_ts  is the OPEN time of the just-closed 5m bar. At 10:15:00 close,
+    #            the bar that closed is the one that opened at 10:10:00.
+    #   +5m      converts that to the moment the 5m bar actually closed (10:15).
+    #   -15m     walks back to 10:00 — the OPEN of the last 15m bar that has
+    #            fully closed by 10:15. Any 15m bar opening at 10:00 or later is
+    #            still forming and must NOT be read.
+    #
+    # Getting this wrong by even one bar means trading on a 15m candle that had
+    # not finished forming, and the backtest would then be measuring a strategy
+    # the live bot never runs.
     cutoff = last_ts + MINUTES_PER_BAR[bar5] * 60_000 - 15 * 60_000
     eligible = [r for r in rows15 if int(r[0]) <= cutoff]
     if len(eligible) < 2:
