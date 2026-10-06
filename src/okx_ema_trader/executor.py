@@ -11,13 +11,17 @@ Design decisions worth stating out loud:
     in-memory `last_side` pattern used by `monitor.py` re-fires on restart; for
     orders that means a duplicate position.
   * `classify` (in strategy.py) returns an EVENT, not a state: a signal appears
-    on the one bar where 5m EMA20 crosses EMA60, and is `None` on every other
+    on the one bar where 5m EMA20 crosses EMA50, and is `None` on every other
     bar. `_classify` recovers WHY it is None so that "still warming up" is never
     mistaken for "the trend flipped".
   * A position is only closed when an OPPOSITE signal arrives. A signal going
     to None leaves the position alone (the user's chosen behaviour).
   * If the ledger and the exchange disagree, we stop. Auto-correcting an
     unknown state is how accounts get liquidated.
+  * Strategy signals decide WHEN to trade; `risk_guard.RiskGuard` decides whether
+    trading is allowed at all. The guard runs first each cycle and its halt is
+    sticky (persisted in the ledger) — a bot that has just lost a third of the
+    account must not quietly start again after a restart.
 """
 from __future__ import annotations
 
@@ -33,7 +37,8 @@ from .config import Config, TradingConfig, load_config
 from .credentials import CredentialsError, load_demo_credentials
 from .history import fetch_candles
 from .indicators import calculate_indicators
-from .state import Ledger, Position, StateError
+from .risk_guard import GuardLimits, RiskGuard, realized_pnl
+from .state import Ledger, Position, RiskState, StateError
 from .strategy import (REASON_ADX, REASON_DEVIATION, REASON_NO_CROSS,
                        REASON_NO_ENV, REASON_WARMUP, Signal, classify)
 
@@ -89,6 +94,12 @@ class Executor:
         self.dry_run = dry_run
         self.proxy = proxy
         self._equity = 0.0
+        # 熔断是账户级的：一轮只看一次，不按 symbol 分开。四笔小亏加起来也
+        # 能把账户打穿，逐个 symbol 查是看不见这件事的。
+        # 阈值来自 config 的 risk 段；那里没配的就由 for_trading 按
+        # stop_loss_pct × leverage 推导。
+        self.guard = RiskGuard(GuardLimits.for_trading(self.trading, config.risk),
+                               broker, ledger)
 
     # ------------------------------------------------------------ startup gate
     def reconcile(self) -> None:
@@ -130,6 +141,19 @@ class Executor:
 
     # --------------------------------------------------------------- one cycle
     def poll(self) -> None:
+        # 风控在策略之前：熔断触发时连 K 线都不用看，这一轮的目标是把仓位平
+        # 掉，而不是找下一个入场点。
+        decision = self.guard.check()
+        if decision.close_symbols:
+            self._flatten(decision.close_symbols)
+        if decision.halted:
+            # 不停在这一行而是继续跑循环，是为了让人工解除（--reset-halt 或
+            # 手改 state.yaml）不用重启进程就能生效。
+            logging.error(
+                "熔断中（%s）——本轮不下单。解除：python -m okx_ema_trader.executor "
+                "--reset-halt，或手改 %s 的 risk 段", decision.reason, self.ledger.path)
+            return
+
         for symbol in self.trading.symbols:
             try:
                 self._poll_symbol(symbol)
@@ -189,6 +213,18 @@ class Executor:
         self._flip(symbol, signal, booked)
 
     # ----------------------------------------------------------------- actions
+    def _flatten(self, symbols) -> None:
+        """平掉风控点名的仓位。平不掉就继续喊，绝不假装已经平了。"""
+        for symbol in symbols:
+            try:
+                self.broker.close_position(symbol)
+                self.broker.cancel_stops(symbol)
+            except BrokerError as exc:
+                logging.error("%s: 熔断平仓失败（%s）——请人工处理", symbol, exc)
+                continue
+            self.ledger.clear(symbol)
+        self.ledger.save()
+
     def _flip(self, symbol: str, signal: Signal, booked: Position) -> None:
         """Close the old side (if any) and open the new one with its stop."""
         if booked.is_open:
@@ -201,8 +237,26 @@ class Executor:
                     f"refusing to open a new position until {self.ledger.path} is corrected"
                 )
             self.broker.cancel_stops(symbol)
+            try:
+                exit_price = self.broker.price(symbol)
+            except BrokerError as exc:
+                # 读不到成交价就用止损价兜底：挂出去的就是这个价，它是我们对
+                # 出场价唯一的先验，比"不知道"强。
+                logging.warning("%s: 读不到平仓价（%s），按止损价估算盈亏", symbol, exc)
+                exit_price = booked.stop_price
+            pnl = realized_pnl(self.broker, symbol, booked, exit_price)
             self.ledger.clear(symbol)
             self.ledger.save()
+
+            if pnl is not None:
+                # 平仓之后、开新仓之前记账：_flip 是平掉反手再开，顺序反了熔
+                # 断挡住的就永远是下一笔。
+                decision = self.guard.record_close(pnl)
+                if decision.halted:
+                    self._flatten(decision.close_symbols)
+                    return
+            else:
+                logging.warning("%s: 这一笔的盈亏算不出来，未计入风控计数", symbol)
 
         equity = self.broker.verify_demo() if not self.dry_run else self._equity
         exposure = exposure_for(self.trading, equity)
@@ -267,6 +321,11 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true",
                         help="run the full decision loop but place no orders")
     parser.add_argument("--once", action="store_true", help="one cycle, then exit")
+    parser.add_argument("--reset-halt", action="store_true",
+                        help="解除账户级熔断：清空 state.yaml 的 risk 段（halt 标记、连亏计数、"
+                             "回撤基准），然后退出不交易。注意回撤基准会在下一轮以当时的权益"
+                             "重建——也就是说解除等于重新给一份额度，先确认账户状态再执行。"
+                             "手改 state.yaml 的 risk 段效果相同。")
     args = parser.parse_args()
 
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -298,6 +357,22 @@ def main() -> None:
         logging.warning("leverage %dx: a ~%.1f%% adverse move liquidates a full-equity position",
                         trading.leverage, 100.0 / trading.leverage)
 
+    # 账本先读：解除熔断（--reset-halt）不该依赖凭证是否可用——熔断刚发生的
+    # 时候，正是最可能想先看一眼状态、再决定要不要解除的时候。
+    try:
+        ledger = Ledger.load(Path(args.state))
+    except StateError as exc:
+        logging.error("state: %s", exc)
+        raise SystemExit(1)
+
+    if args.reset_halt:
+        was_halted = ledger.risk.halted
+        ledger.risk = RiskState()  # halt 标记、连亏计数、回撤基准一起清
+        ledger.save()
+        logging.warning("熔断已解除（之前 halted=%s）：%s 的 risk 段已清空",
+                        was_halted, args.state)
+        return
+
     try:
         credentials = load_demo_credentials(args.profile)
     except CredentialsError as exc:
@@ -311,12 +386,6 @@ def main() -> None:
         logging.info("using proxy %s", proxy)
 
     broker = Broker(credentials, proxy=proxy, dry_run=args.dry_run)
-    try:
-        ledger = Ledger.load(Path(args.state))
-    except StateError as exc:
-        logging.error("state: %s", exc)
-        raise SystemExit(1)
-
     executor = Executor(config, broker, ledger, dry_run=args.dry_run, proxy=proxy)
     try:
         executor.reconcile()

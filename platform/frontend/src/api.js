@@ -27,6 +27,7 @@ export const api = {
   // Upstream connectivity + the circuit breaker: "can we still see the market".
   status: () => request('/api/status'),
   riskCheck: () => request('/api/risk/check', { method: 'POST' }),
+  riskReset: () => request('/api/risk/reset', { method: 'POST' }),
   candles: (symbol, bar, limit = 500, sync = true) =>
     request(`/api/candles?symbol=${encodeURIComponent(symbol)}&bar=${bar}&limit=${limit}&sync=${sync}`),
   ticker: (symbol) => request(`/api/ticker?symbol=${encodeURIComponent(symbol)}`),

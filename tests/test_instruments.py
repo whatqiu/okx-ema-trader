@@ -262,7 +262,7 @@ def test_json_is_browser_parseable():
     whole backtest panel render blank.
     """
     print("\njson never emits NaN/Infinity")
-    from okx_ema_trader.console_server import _json_safe
+    from okx_ema_trader.jsonio import json_safe as _json_safe
 
     payload = {"ruin": float("inf"), "nan": float("nan"),
                "nested": [1.0, float("-inf"), {"x": float("nan")}],
@@ -280,10 +280,11 @@ def test_json_is_browser_parseable():
     except ValueError as exc:
         _check("round-trips through strict JSON", False, str(exc))
 
-    from okx_ema_trader import console_api
-    _check("console_api._finite(inf)", console_api._finite(float("inf")) is None)
-    _check("console_api._finite(nan)", console_api._finite(float("nan")) is None)
-    _check("console_api._finite(6.6)", console_api._finite(6.6) == 6.6)
+    from okx_ema_trader.jsonio import finite
+
+    _check("finite(inf)", finite(float("inf")) is None)
+    _check("finite(nan)", finite(float("nan")) is None)
+    _check("finite(6.6)", finite(6.6) == 6.6)
 
     # np.int64 / np.bool_ are not int subclasses: json.dumps rejects them and
     # the endpoint 500s. numpy floats are caught by the float branch instead.

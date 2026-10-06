@@ -196,13 +196,136 @@ class RiskDecision:
     should_close: bool = False
     reason: str = ""
     detail: dict = field(default_factory=dict)
+    # True when the reason is about the ACCOUNT rather than about one position,
+    # so the fix is not "close it and carry on" but "stop opening anything".
+    # The caller latches this into a halt; see `clear_risk_halt`.
+    halt: bool = False
 
     def as_dict(self) -> dict:
         return {"should_close": self.should_close, "reason": self.reason,
                 **self.detail}
 
 
-def evaluate_risk(positions: list[dict], *, equity: float, initial: float,
+# --------------------------------------------------------------------------
+# Latched halt — "stop opening", which is NOT the same as "close what is open"
+# --------------------------------------------------------------------------
+# A brake that flattens the book and then lets the next crossover re-open it has
+# not stopped anything: it just pays the spread on both sides every few minutes,
+# which is worse than never having intervened. So the two account-level triggers
+# LATCH. The halt outlives the pass that raised it, outlives the process, and is
+# cleared only by a human — see `clear_risk_halt`.
+#
+# Persisted in store.meta rather than held in memory: the whole point is to
+# remember across a restart, and a process-local flag forgets at exactly the
+# moment the operator is most likely to be away.
+HALT_KEY = "risk_halted"
+HALT_REASON_KEY = "risk_halt_reason"
+HALT_AT_KEY = "risk_halt_at"
+# Cursor for the losing-streak counter, moved forward by a manual reset.
+STREAK_FROM_KEY = "risk_streak_from"
+# Drawdown baseline — see `risk_baseline`.
+BASELINE_KEY = "risk_baseline_equity"
+
+
+def risk_baseline(store, equity: float) -> float:
+    """The equity the drawdown brake measures from, pinned on first sight.
+
+    Deliberately NOT the account's opening balance. This brake did not exist for
+    most of this account's life, so charging it for losses booked before it was
+    installed would latch a halt on the very first pass after an upgrade — and
+    `clear_risk_halt` does not re-base, so the operator could not get out of it.
+    Installing the brake is the moment the baseline is set: whatever the account
+    is worth right then, that is the number we protect from here on.
+    """
+    raw = store.get_meta(BASELINE_KEY)
+    if raw:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 0.0
+        # Pinned once and then left alone. Re-pinning on every restart would
+        # hand the account a fresh allowance for free, which is how a brake
+        # turns into a rubber stamp.
+        if value > 0:
+            return value
+    store.set_meta(BASELINE_KEY, f"{float(equity):.8f}")
+    return float(equity)
+
+
+def clear_risk_baseline(store) -> None:
+    """Forget the baseline so the next pass pins it to the new equity.
+
+    Called when the paper account is reset: carrying the old baseline into a
+    fresh balance would mean the account is already deep in a drawdown the
+    instant it opens, against money that never existed.
+    """
+    store.set_meta(BASELINE_KEY, "")
+
+
+def risk_halt_state(store) -> dict:
+    """The latched halt as every caller should read it: straight from meta."""
+    return {
+        "halted": store.get_meta(HALT_KEY, "0") == "1",
+        "reason": store.get_meta(HALT_REASON_KEY) or "",
+        "at": int(store.get_meta(HALT_AT_KEY, "0") or 0),
+    }
+
+
+def risk_halted(store) -> bool:
+    """True while the brake refuses to let the strategy add exposure."""
+    return risk_halt_state(store)["halted"]
+
+
+def set_risk_halt(store, reason: str, now_ms: int | None = None) -> dict:
+    store.set_meta(HALT_KEY, "1")
+    store.set_meta(HALT_REASON_KEY, str(reason))
+    store.set_meta(HALT_AT_KEY,
+                   str(int(time.time() * 1000) if now_ms is None else now_ms))
+    return risk_halt_state(store)
+
+
+def clear_risk_halt(store, *, rebase_streak: bool = True) -> dict:
+    """Human override: lift the halt.
+
+    `rebase_streak` moves the losing-streak cursor to the newest order so the
+    count restarts from the reset. Without it the five losses that CAUSED the
+    halt are still the five most recent closes one pass later, the brake
+    re-latches instantly, and the reset button is decoration.
+
+    The drawdown trigger is deliberately NOT re-based: it reads a live number.
+    An account that is still 25% down is still 25% down, and forgiving it would
+    mean the operator silently overruled the brake with no visible cause. Reset
+    the account (`/api/account/reset`) for that.
+    """
+    store.set_meta(HALT_KEY, "0")
+    store.set_meta(HALT_REASON_KEY, "")
+    store.set_meta(HALT_AT_KEY, "0")
+    if rebase_streak:
+        store.set_meta(STREAK_FROM_KEY, str(_newest_order_id(store)))
+    return risk_halt_state(store)
+
+
+def _newest_order_id(store) -> int:
+    with store._connect() as conn:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM orders").fetchone()
+    return int(row["m"])
+
+
+def _streak_from(store) -> int:
+    return int(store.get_meta(STREAK_FROM_KEY, "0") or 0)
+
+
+def _halt_fields(store) -> dict:
+    """Halt snapshot for a report, tolerating a store that cannot be read."""
+    try:
+        state = risk_halt_state(store)
+    except Exception:
+        return {"halted": False, "halt_reason": "", "halt_at": 0}
+    return {"halted": state["halted"], "halt_reason": state["reason"],
+            "halt_at": state["at"]}
+
+
+def evaluate_risk(positions: list[dict], *, equity: float, baseline: float,
                   limits: RiskLimits, consecutive_losses: int = 0) -> RiskDecision:
     """Should any open position be closed right now, ignoring the strategy?
 
@@ -210,6 +333,10 @@ def evaluate_risk(positions: list[dict], *, equity: float, initial: float,
     already carry `margin`, `unrealised_pnl`, `liq_price` and `mark_price`.
     Every returned decision names the single worst reason so the UI can show one
     clear cause instead of a list of near-misses.
+
+    `baseline` is the drawdown reference — see `risk_baseline`. It is NOT the
+    account's opening balance, and calling it `initial` was exactly the kind of
+    name that made `max_daily_loss_pct` mean something nobody intended.
     """
     if not limits.enabled:
         return RiskDecision()
@@ -220,7 +347,7 @@ def evaluate_risk(positions: list[dict], *, equity: float, initial: float,
     if (limits.max_consecutive_losses > 0
             and consecutive_losses >= limits.max_consecutive_losses):
         return RiskDecision(
-            should_close=True, reason="losing-streak",
+            should_close=True, reason="losing-streak", halt=True,
             detail={"streak": consecutive_losses,
                     "limit": limits.max_consecutive_losses},
         )
@@ -247,12 +374,13 @@ def evaluate_risk(positions: list[dict], *, equity: float, initial: float,
             if distance <= limits.liq_buffer_pct:
                 condemned[p["id"]] = f"liquidation-risk:{p.get('inst_id')}"
 
-    # 3. Daily account loss. Counted from `initial` because `equity` already
-    #    includes unrealised PnL, which is what we want: the brake should react
-    #    to open positions bleeding, not only to closed ones.
+    # 3. Account loss against `baseline` (not the opening balance — see
+    #    `risk_baseline`). `equity` already includes unrealised PnL, which is
+    #    what we want: the brake should react to open positions bleeding, not
+    #    only to closed ones.
     account_level = ""
-    if limits.max_daily_loss_pct > 0 and initial > 0:
-        drawdown = (initial - equity) / initial * 100.0
+    if limits.max_daily_loss_pct > 0 and baseline > 0:
+        drawdown = (baseline - equity) / baseline * 100.0
         if drawdown >= limits.max_daily_loss_pct:
             account_level = "account-drawdown"
 
@@ -261,9 +389,9 @@ def evaluate_risk(positions: list[dict], *, equity: float, initial: float,
         # already found is irrelevant next to "the account is down a quarter" —
         # and leaving the survivors open is how a bad hour becomes a bad day.
         return RiskDecision(
-            should_close=True, reason=account_level,
+            should_close=True, reason=account_level, halt=True,
             detail={"drawdown_pct": round(
-                        (initial - equity) / initial * 100.0, 2),
+                        (baseline - equity) / baseline * 100.0, 2),
                     "limit_pct": limits.max_daily_loss_pct,
                     "condemned": sorted(condemned) or "ALL"},
         )
@@ -282,17 +410,24 @@ def evaluate_risk(positions: list[dict], *, equity: float, initial: float,
     return RiskDecision()
 
 
-def consecutive_losses(store) -> int:
+def consecutive_losses(store, since_id: int = 0) -> int:
     """How many closed trades in a row have lost money, counting back from now.
 
     A winning trade resets the count to zero. `pnl IS NULL` trades are skipped
     rather than counted as wins: an unpriced close is not good news.
+
+    `since_id` is the manual-reset cursor written by `clear_risk_halt`: orders
+    at or below it are not counted. See `losing_streak` for why the brake must
+    read the count this way rather than the raw one.
     """
+    sql = ("SELECT pnl FROM orders WHERE status='closed' AND pnl IS NOT NULL ")
+    args: tuple = ()
+    if since_id:
+        sql += "AND id > ? "
+        args = (int(since_id),)
+    sql += "ORDER BY COALESCE(closed_at, created_at) DESC, id DESC"
     with store._connect() as conn:
-        rows = conn.execute(
-            "SELECT pnl FROM orders WHERE status='closed' AND pnl IS NOT NULL "
-            "ORDER BY COALESCE(closed_at, created_at) DESC, id DESC"
-        ).fetchall()
+        rows = conn.execute(sql, args).fetchall()
     streak = 0
     for r in rows:
         if float(r["pnl"]) < 0:
@@ -300,6 +435,17 @@ def consecutive_losses(store) -> int:
         else:
             break
     return streak
+
+
+def losing_streak(store) -> int:
+    """The streak the brake judges: counted from the last manual reset.
+
+    The raw `consecutive_losses` is history that cannot change; a brake reading
+    it would re-latch forever once it fired, so the reset has to move the
+    cursor. This is the single place that decision lives, so the number in
+    /api/status and the number the brake acts on can never disagree.
+    """
+    return consecutive_losses(store, _streak_from(store))
 
 
 def enforce_risk(store, *, limits: RiskLimits, marks: dict | None = None,
@@ -310,30 +456,47 @@ def enforce_risk(store, *, limits: RiskLimits, marks: dict | None = None,
     and filling use the same price instant — a stop computed off one tick and
     filled at another is not a stop.
 
-    Returns a report for the UI. Deliberately keeps going after one failure: a
-    broker hiccup on position A must not leave position B unprotected. Only when
-    EVERY close failed do we report the error loudly.
+    Returns a report for the UI, including `halted` — the latched "stop opening"
+    state. Deliberately keeps going after one failure: a broker hiccup on
+    position A must not leave position B unprotected. Only when EVERY close
+    failed do we report the error loudly.
     """
     import paper  # local import: paper must not depend on this module
 
     report: dict = {"closed": [], "failed": [], "checked": 0, "reason": "",
-                    "error": ""}
+                    "error": "", "halted": False, "halt_reason": "",
+                    "halt_at": 0}
     try:
         account = paper.account_summary(store, marks, exit_prices)
     except Exception as exc:                      # store unreadable
         report["error"] = f"无法读取账户：{exc}"
+        # Still surface a latched halt: "we could not check this pass" must not
+        # read as "everything is fine" on the badge.
+        report.update(_halt_fields(store))
         return report
 
     positions = account.get("positions") or []
     report["checked"] = len(positions)
-    if not positions:
-        return report
 
+    # NOTE: there is deliberately no early return on an empty book. The account-
+    # level triggers answer "may the strategy open NEW risk?", and that question
+    # is most urgent when nothing is open yet — a five-loss streak is a fact
+    # about the trades that CLOSED, not about the book.
     equity = float(account.get("equity") or 0.0)
-    initial = float(account.get("initial") or 0.0)
-    decision = evaluate_risk(positions, equity=equity, initial=initial,
+    # Not `account["initial"]`: that is the balance the account OPENED with, and
+    # this brake was not running for most of it. See `risk_baseline`.
+    baseline = risk_baseline(store, equity)
+    decision = evaluate_risk(positions, equity=equity, baseline=baseline,
                              limits=limits,
-                             consecutive_losses=consecutive_losses(store))
+                             consecutive_losses=losing_streak(store))
+    if decision.halt:
+        # Latched here, not by the caller: this is the only place that knows
+        # whether THIS pass hit an account-level trigger.
+        set_risk_halt(store, decision.reason)
+    # Read back rather than trusting the flag above: a halt raised on an earlier
+    # pass is still a halt, and the report is what the UI and the auto-trader
+    # both look at.
+    report.update(_halt_fields(store))
     if not decision.should_close:
         return report
     report["reason"] = decision.reason

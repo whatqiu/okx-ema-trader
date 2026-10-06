@@ -71,6 +71,12 @@ const connOk = computed(() => !!status.value?.connected)
 const offlineFor = computed(() => status.value?.market?.offline_for_s ?? 0)
 const losingStreak = computed(() => status.value?.risk?.losing_streak ?? 0)
 const riskActive = computed(() => !!status.value?.risk?.limits?.enabled)
+// A latched halt is the one state the UI has to explain rather than just show:
+// the bot looks alive and simply will not open anything, and only a human can
+// lift it. Without this the user's conclusion is "the bot broke".
+const riskHalted = computed(() => !!status.value?.risk?.halted)
+const riskHaltReason = computed(() => status.value?.risk?.halt_reason || '')
+const riskBusy = ref(false)
 
 function fmtDuration(seconds) {
   const s = Math.max(0, Math.floor(seconds || 0))
@@ -98,11 +104,14 @@ async function loadStatus() {
     }
     // A risk close that happened in the background is the single most important
     // thing this panel can tell you — a position died while you were away.
+    //
+    // Cleared as well as set: this polls every 4s, and a banner that is only
+    // ever assigned stays on screen forever, still accusing a system that has
+    // since recovered (or been manually reset).
     const closed = s?.risk?.last?.closed || []
-    if (closed.length) {
-      const last = closed[closed.length - 1]
-      riskToast.value = `风控平仓：${last.reason}`
-    }
+    riskToast.value = closed.length
+      ? `风控平仓：${closed[closed.length - 1].reason}`
+      : ''
   } catch {
     // Backend itself unreachable. Leave the previous state alone so the badge
     // does not flip to a false "offline from OKX" — the process is the problem.
@@ -403,6 +412,15 @@ async function toggleAutoTrade() {
   })
   autoBusy.value = false
 }
+async function resetRisk() {
+  riskBusy.value = true
+  await guard(async () => {
+    await api.riskReset()
+    await loadStatus()
+    flash('熔断已解除，连亏计数从现在起重算')
+  })
+  riskBusy.value = false
+}
 async function saveAutoParams() {
   autoBusy.value = true
   await guard(async () => {
@@ -518,6 +536,11 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
       <span class="dim">断线期间无法获取实时价格，浮亏按开仓价估算；恢复后风控会立即重新判定。</span>
     </div>
     <div v-if="riskToast" class="risk-banner">{{ riskToast }}</div>
+    <div v-if="riskHalted" class="halt-banner">
+      <strong>风控已熔断：{{ riskHaltReason || '未知原因' }}</strong>
+      <span class="dim">已停止开新仓（平仓/减仓仍可用），需要人工解除。</span>
+      <button class="btn ghost" :disabled="riskBusy" @click="resetRisk">解除熔断</button>
+    </div>
 
     <div v-if="showSettings" class="settings-bar">
       <span class="dim">代理（当前生效: {{ resolvedProxy }}）</span>
@@ -591,7 +614,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
       <!-- center: chart -->
       <section class="col center">
         <div class="chart-box">
-          <KlineChart :rows="rows" :markers="markers" :ema-fast="9" :ema-slow="26" />
+          <KlineChart :rows="rows" :markers="markers" :ema-fast="20" :ema-slow="50" />
         </div>
         <div class="statusline">
           <span :class="syncing ? 'warn' : 'dim'">
@@ -623,7 +646,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
               </button>
             </div>
             <div class="auto-meta dim">
-              策略：15m 趋势 + ADX&gt;20 + 5m EMA20/60 交叉 · 每根 5m 收盘评估 ·
+              策略：15m 趋势 + ADX&gt;20 + 5m EMA20/50 交叉 · 每根 5m 收盘评估 ·
               无信号不操作
             </div>
 
@@ -944,6 +967,13 @@ body {
   background: rgba(240, 185, 11, 0.14); color: var(--warn);
   padding: 6px 14px; border-bottom: 1px solid var(--border);
 }
+.halt-banner {
+  display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  background: rgba(246, 70, 93, 0.15); color: var(--down);
+  padding: 7px 14px; border-bottom: 1px solid var(--border);
+}
+.halt-banner strong { font-weight: 600; }
+.halt-banner .dim { color: var(--dim); font-size: 12px; }
 
 .grid {
   flex: 1; display: grid; gap: 4px; padding: 4px;

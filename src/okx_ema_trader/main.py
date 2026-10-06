@@ -31,6 +31,13 @@ class Trader:
             except Exception as exc:
                 logging.warning("history warm-up failed for %s: %s", bar, exc)
                 continue
+            # `/market/candles` always returns the still-forming bar last. The
+            # executor (`_closed`) and the monitor (`Monitor.closed`) both drop
+            # it, and the WS path below only trusts rows with confirm == "1".
+            # Warm-up has to agree, or the first evaluation after every
+            # reconnect reads a half-built candle as if it had closed.
+            if len(series) > 1:
+                series = series[:-1]
             self.candles[bar] = series
             logging.info("warmed up %s with %d candles", bar, len(series))
 

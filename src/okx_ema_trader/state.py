@@ -39,6 +39,11 @@ class Position:
     entry_order_id: str = ""
     stop_order_id: str = ""
     stop_price: float = 0.0
+    # True = 这笔仓位的已实现盈亏已经结算进风控计数（见 risk_guard.RiskGuard）。
+    # 只在"账本还记着、交易所已经没了"时置位：那种情况几乎总是止损被打掉，
+    # 而策略侧的 _flip 根本不会经过，不补记一笔连亏计数就永远是 0。
+    # 置位后账本故意不清空——交易所与账本不一致要留给人看，见 reconcile()。
+    settled: bool = False
 
     @property
     def is_open(self) -> bool:
@@ -63,7 +68,49 @@ class Position:
             entry_order_id=str(raw.get("entry_order_id", "") or ""),
             stop_order_id=str(raw.get("stop_order_id", "") or ""),
             stop_price=float(raw.get("stop_price", 0.0) or 0.0),
+            settled=bool(raw.get("settled", False)),
         )
+
+
+@dataclass
+class RiskState:
+    """账户级熔断的持久状态（规则本身在 risk_guard.py，这里只存数据）。
+
+    为什么写在账本里而不是内存：熔断必须比进程活得久。重启后如果 halt 标记
+    消失，一个刚刚亏掉三成的机器人会带着全新的额度重新开仓——那正是熔断要
+    阻止的事。
+
+    `peak_equity` 是回撤基准，语义是"历史最高权益"，不是"本次启动时的权益"。
+    用峰值而不是启动值，是因为启动值每次重启都会重置，等于每重启一次就白送
+    一份亏损额度；峰值只增不减，充值后会自动抬高，这是回撤的通常定义。
+    """
+
+    halted: bool = False
+    halt_reason: str = ""
+    peak_equity: float = 0.0
+    consecutive_losses: int = 0
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "RiskState":
+        # 逐个字段用 .get 读，缺失即默认值：旧版 state.yaml 里没有 risk 段。
+        # 这里刻意不升 SCHEMA_VERSION —— Ledger.load() 见到版本号不同就直接
+        # StateError，升版本会让每一个已有的 state.yaml 变成"启动即崩"。
+        if not isinstance(raw, dict):
+            raise StateError(f"risk entry is {type(raw).__name__}, expected mapping")
+        return cls(
+            halted=bool(raw.get("halted", False)),
+            halt_reason=str(raw.get("halt_reason", "") or ""),
+            peak_equity=float(raw.get("peak_equity", 0.0) or 0.0),
+            consecutive_losses=int(raw.get("consecutive_losses", 0) or 0),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "halted": self.halted,
+            "halt_reason": self.halt_reason,
+            "peak_equity": round(self.peak_equity, 8),
+            "consecutive_losses": self.consecutive_losses,
+        }
 
 
 @dataclass
@@ -72,6 +119,8 @@ class Ledger:
 
     positions: dict[str, Position] = field(default_factory=dict)
     path: Path | None = None
+    # 账户级熔断状态，和持仓写在同一个文件里：熔断必须和"我持有什么"一样持久。
+    risk: RiskState = field(default_factory=RiskState)
 
     def get(self, symbol: str) -> Position:
         """Ledger's view of a symbol; flat when never traded."""
@@ -99,6 +148,7 @@ class Ledger:
         return {
             "version": SCHEMA_VERSION,
             "positions": {sym: asdict(pos) for sym, pos in self.positions.items()},
+            "risk": self.risk.to_dict(),
         }
 
     def save(self) -> None:
@@ -156,4 +206,5 @@ class Ledger:
             raise StateError(f"{path} 'positions' should be a mapping, got {type(positions_raw).__name__}")
 
         positions = {str(sym): Position.from_dict(entry) for sym, entry in positions_raw.items()}
-        return cls(positions=positions, path=path)
+        return cls(positions=positions, path=path,
+                   risk=RiskState.from_dict(raw.get("risk") or {}))

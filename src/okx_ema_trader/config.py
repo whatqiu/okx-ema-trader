@@ -20,6 +20,26 @@ class TradingConfig:
 
 
 @dataclass(frozen=True)
+class RiskConfig:
+    """Account-level circuit-breaker thresholds (the rules live in risk_guard.py).
+
+    Every field uses `None` for "not configured" — meaning fall back to the code
+    default or to the value derived from the trading settings. `None` and `0` are
+    deliberately different:
+
+      * None = 没配过，用默认值或按 stop_loss_pct × leverage 自动推导；
+      * 0    = 明确关掉这一条熔断（回撤 99% 也不因此停手）。
+
+    Keeping them apart is what lets a config.yaml that predates this section
+    (no `risk:` block at all) load unchanged.
+    """
+
+    max_drawdown_pct: float | None = None
+    max_consecutive_losses: int | None = None
+    max_position_loss_pct: float | None = None
+
+
+@dataclass(frozen=True)
 class Config:
     symbol: str
     bar_5m: str
@@ -34,6 +54,13 @@ class Config:
     reconnect_seconds: int
     log_level: str
     trading: TradingConfig = field(default_factory=TradingConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
+
+
+def _optional(raw: dict, key: str, cast) -> object:
+    """`raw[key]` when present, else None. Distinguishes "absent" from 0."""
+    value = raw.get(key)
+    return None if value is None else cast(value)
 
 
 def load_config(path: str | Path) -> Config:
@@ -67,6 +94,13 @@ def load_config(path: str | Path) -> Config:
         position_mode=str(trading.get("position_mode", "cross")),
     )
 
+    risk_raw = raw.get("risk") or {}
+    risk_config = RiskConfig(
+        max_drawdown_pct=_optional(risk_raw, "max_drawdown_pct", float),
+        max_consecutive_losses=_optional(risk_raw, "max_consecutive_losses", int),
+        max_position_loss_pct=_optional(risk_raw, "max_position_loss_pct", float),
+    )
+
     config = Config(
         symbol=raw["symbol"], bar_5m=raw["bar_5m"], bar_15m=raw["bar_15m"],
         candle_limit=int(raw["candle_limit"]), ema_fast=int(strategy["ema_fast"]),
@@ -74,7 +108,7 @@ def load_config(path: str | Path) -> Config:
         adx_min=float(strategy["adx_min"]),
         deviation_max=float(strategy.get("deviation_max", 0.02)),
         reconnect_seconds=int(runtime["reconnect_seconds"]),
-        log_level=runtime["log_level"], trading=trading_config,
+        log_level=runtime["log_level"], trading=trading_config, risk=risk_config,
     )
     validate(config)
     return config
@@ -117,3 +151,17 @@ def validate(config: Config) -> None:
         raise ValueError(f"position_mode must be 'cross' or 'isolated', got {trading.position_mode!r}")
     if not trading.symbols:
         raise ValueError("trading.symbols must list at least one instrument")
+
+    # 熔断阈值的上界必须挡在启动前：一个永远触发不了的阈值不是"宽松"，是静默
+    # 失效——回撤不可能超过 100%，单仓浮亏最多亏掉全部权益，写过头等于没写。
+    # 0 是合法的，意思是"明确关掉这一条"；None 是"没配"，交给代码决定。
+    risk = config.risk
+    if risk.max_drawdown_pct is not None and not 0 <= risk.max_drawdown_pct <= 100:
+        raise ValueError(
+            f"risk.max_drawdown_pct must be in [0, 100] (0 disables), got {risk.max_drawdown_pct}")
+    if risk.max_consecutive_losses is not None and risk.max_consecutive_losses < 0:
+        raise ValueError(
+            f"risk.max_consecutive_losses must be >= 0 (0 disables), got {risk.max_consecutive_losses}")
+    if risk.max_position_loss_pct is not None and not 0 <= risk.max_position_loss_pct <= 90:
+        raise ValueError(
+            f"risk.max_position_loss_pct must be in [0, 90] (0 disables), got {risk.max_position_loss_pct}")

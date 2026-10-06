@@ -116,6 +116,10 @@ class Trade:
 @dataclass(frozen=True)
 class Report:
     trades: list[Trade]
+    # Cumulative P&L in units of notional, sampled once per BAR and marked to
+    # market: an open position's unrealised loss is included. Starts at 0.
+    # Gross/net return come from `trades` + `turnover`, never from this series;
+    # it exists solely so drawdown and ruin describe the account.
     equity: np.ndarray
     cost_per_unit_bps: float
     turnover: float
@@ -149,7 +153,7 @@ class Report:
     def equity_index(self, exposure: float = 1.0) -> np.ndarray:
         """The account, expressed as a multiple of its starting value.
 
-        `equity` is cumulative P&L in units of NOTIONAL — it starts at 0 and
+        `equity` is cumulative P&L in units of NOTIONAL — it starts at 0, so
         its peak is a profit figure, not capital. It is a P&L ledger, not an
         equity curve, and treating it as one is what produced a "284% maximum
         drawdown": a 23% swing divided by an 8% profit peak. To talk about
@@ -212,15 +216,21 @@ def simulate(
 
       1. fill whatever bar N-1 decided, at bar N's OPEN;
       2. check the stop against bar N's high/low (conservative);
-      3. decide on bar N's CLOSE -> an order that can only fill on bar N+1.
+      3. mark the book to bar N's CLOSE and record it (see 2b below);
+      4. decide on bar N's CLOSE -> an order that can only fill on bar N+1.
 
     A signal produced on the final bar therefore never fills.
+
+    `equity` is sampled per BAR and marked to market, so an open position's
+    unrealised loss is part of the series. That is what makes the drawdown and
+    the ruin leverage describe the account rather than the trade log.
     """
     ts_5m = frame_5m["ts"].to_numpy()
     ts_15m = frame_15m["ts"].to_numpy()
     opens = frame_5m["open"].to_numpy()
     highs = frame_5m["high"].to_numpy()
     lows = frame_5m["low"].to_numpy()
+    closes = frame_5m["close"].to_numpy()
     # For a 5m bar starting at S we decide at its close S+5m, so a 15m bar is
     # only usable if it finished by then: ts_15m + 15m <= S + 5m.
     usable_until = ts_5m + lookahead_ms
@@ -297,6 +307,20 @@ def simulate(
                 equity_curve.append(equity)
                 position = 0
                 stopped_out += 1
+
+        # --- 2b) Mark-to-market sample, taken on EVERY bar.
+        # Sampling only on trade exits (the old behaviour) measures the
+        # drawdown of the realised P&L stream, and a position can be far
+        # underwater long before it is closed. On a 30-day 5m run that is 16
+        # samples against 8638 bars: the worst intra-trade loss — the only
+        # thing a liquidation actually cares about — is invisible, and
+        # `ruin_exposure` comes out materially too high (measured: 30.9x vs a
+        # true 23.4x on AAVE). Unrealised loss must be in the series for
+        # drawdown and ruin to mean anything.
+        equity_curve.append(
+            equity + ((float(closes[index]) - entry_price) / entry_price * position
+                      if position != 0 else 0.0)
+        )
 
         # --- 3) Entry decision. Closed 5m bar, and the 15m bar closed by then.
         cutoff = usable_until[index] - 15 * 60_000
@@ -423,6 +447,20 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="how many round trips to list in detail (default: 20, 0 = all)",
     )
+    parser.add_argument(
+        "--stop-pct",
+        type=float,
+        default=None,
+        help="override stop_loss_pct from config. Use 999 to model a strategy "
+             "with NO stop: exit only on the opposite signal (or at the end).",
+    )
+    parser.add_argument(
+        "--leverage",
+        type=float,
+        default=None,
+        help="override trading.leverage when converting to the account view. "
+             "Lets you ask 'what would 30x have done' without editing config.",
+    )
     return parser.parse_args()
 
 
@@ -448,13 +486,16 @@ def main() -> None:
     frame_15m = indicator_frame(candles_15m, config.ema_fast, config.ema_slow, config.adx_period)
     lookahead_ms = MINUTES_PER_BAR[config.bar_5m] * 60_000
 
+    stop_pct = args.stop_pct if args.stop_pct is not None \
+        else config.trading.stop_loss_pct
     report = simulate(frame_5m, frame_15m, config.adx_min, config.deviation_max,
-                      cost_per_unit_bps, lookahead_ms, config.trading.stop_loss_pct)
+                      cost_per_unit_bps, lookahead_ms, stop_pct)
 
     print("")
     print("=" * 58)
     print(f"  {symbol}  EMA{config.ema_fast}/{config.ema_slow}  ADX>{config.adx_min}  last {args.days}d")
-    print(f"  deviation<={config.deviation_max:.2%} on 15m   stop={config.trading.stop_loss_pct:.1f}%")
+    print(f"  deviation<={config.deviation_max:.2%} on 15m   "
+          f"stop={'off' if stop_pct >= 100 else f'{stop_pct:.1f}%'}")
     print("=" * 58)
     if not report.trades:
         print("  no completed round trips — strategy stayed flat the whole window")
@@ -479,10 +520,11 @@ def main() -> None:
     # one describes what it does to the account.
     trading = config.trading
     if trading.sizing_mode == "equity":
-        exposure = trading.equity_pct / 100.0 * trading.leverage
+        lev = args.leverage if args.leverage is not None else trading.leverage
+        exposure = trading.equity_pct / 100.0 * lev
         ruined = report.wiped_out(exposure)
         print(f"  account exposure  : {exposure:g}x  "
-              f"({trading.equity_pct:g}% equity @ {trading.leverage}x)")
+              f"({trading.equity_pct:g}% equity @ {lev:g}x)")
         print(f"  max drawdown      : {report.max_drawdown(exposure):.2%}  (账户口径)")
         print(f"  account wiped out : {'YES — 这轮会爆仓' if ruined else 'no'}")
         print(f"  ruin leverage     : {report.ruin_exposure():.2f}x  "

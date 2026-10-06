@@ -1,6 +1,6 @@
 """Standalone signal monitor with Windows desktop alerts.
 
-Polls OKX public candles for one instrument, evaluates the same EMA20/EMA60 +
+Polls OKX public candles for one instrument, evaluates the same EMA20/EMA50 +
 ADX rule as the main strategy, and raises a Windows toast when the direction
 changes. Read-only: public market data only, no API key, no orders, no account
 access.
@@ -110,11 +110,14 @@ class Monitor:
         if reason == REASON_ADX:
             why = f"ADX {i15['adx']:.1f} 未超过阈值 {self.config.adx_min:.0f}（震荡）"
         elif reason == REASON_DEVIATION:
-            why = f"15m 价格偏离 EMA20 超过 {self.config.deviation_max:.2%}（不追）"
+            why = (f"15m 价格偏离 EMA{self.config.ema_fast} 超过 "
+                   f"{self.config.deviation_max:.2%}（不追）")
         elif reason == REASON_NO_CROSS:
-            why = "5m 未发生 EMA20/EMA60 交叉（趋势延续中，不是入场点）"
+            why = (f"5m 未发生 EMA{self.config.ema_fast}/EMA{self.config.ema_slow} 交叉"
+                   "（趋势延续中，不是入场点）")
         elif reason == REASON_NO_ENV:
-            why = "15m EMA20 与 EMA60 黏合，无方向"
+            why = (f"15m EMA{self.config.ema_fast} 与 EMA{self.config.ema_slow} 黏合，"
+                   "无方向")
         else:
             why = "指标尚未就绪"
         title = "OKX 信号消失"

@@ -53,7 +53,7 @@ def fresh_store():
 
 
 def seed(store, inst: str, n5: int = 120, n15: int = 60):
-    """Enough confirmed bars to clear warmup (ema_slow=60). Prices must MOVE:
+    """Enough confirmed bars to clear warmup (ema_slow=50). Prices must MOVE:
     flat bars make +DM == -DM == 0, so Wilder's DX is 0/0 and ADX stays NaN.
     """
     def bar(ts, p):

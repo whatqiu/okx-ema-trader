@@ -65,6 +65,7 @@ def test_warmup_is_not_signal_loss() -> int:
             print(f"  FAIL {label}: got signal={signal} reason={reason}")
             failures += 1
     print(f"  warm-up separation: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -101,6 +102,7 @@ def test_no_signal_reasons_are_distinguished() -> int:
         failures += 1
 
     print(f"  no-signal reasons: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -122,6 +124,7 @@ def test_adx_is_strictly_greater() -> int:
         failures += 1
 
     print(f"  ADX strictly greater: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -149,6 +152,7 @@ def test_both_directions_need_a_real_cross() -> int:
         failures += 1
 
     print(f"  direction detection: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -164,6 +168,7 @@ def test_closed_drops_forming_candle() -> int:
         print("  FAIL: single candle should pass through unchanged")
         failures += 1
     print(f"  closed-candle filter: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -180,6 +185,7 @@ def test_exposure_semantics() -> int:
         print(f"  FAIL equity 50%@2x on 1000 should be 1000, got {exposure_for(equity, 1000.0)}")
         failures += 1
     print(f"  exposure semantics: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -204,6 +210,7 @@ def test_ledger_roundtrip() -> int:
         print(f"  FAIL open_symbols: {reloaded.open_symbols()}")
         failures += 1
     print(f"  ledger roundtrip: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -226,6 +233,7 @@ def test_ledger_refuses_corrupt_state() -> int:
         except StateError:
             pass
     print(f"  corrupt-state refusal: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -251,7 +259,25 @@ def test_config_values() -> int:
               f"lev={config.trading.leverage} eq={config.trading.equity_pct} "
               f"stop={config.trading.stop_loss_pct}")
         failures += 1
+    # The circuit-breaker limits live in config now, so they are just as easy to
+    # change by accident as leverage is — and a stray edit here silently moves
+    # the point at which the bot stops trading. Pin them the same way.
+    if config.risk.max_drawdown_pct != 60.0:
+        print(f"  FAIL risk.max_drawdown_pct should be 60, "
+              f"got {config.risk.max_drawdown_pct}")
+        failures += 1
+    if config.risk.max_consecutive_losses != 3:
+        print(f"  FAIL risk.max_consecutive_losses should be 3, "
+              f"got {config.risk.max_consecutive_losses}")
+        failures += 1
+    # Left unset on purpose: one stop-out costs stop_loss_pct x leverage = 30%,
+    # so the per-position cap is derived rather than spelled out twice.
+    if config.risk.max_position_loss_pct is not None:
+        print("  FAIL risk.max_position_loss_pct must stay unset so it is "
+              f"derived from stop x leverage, got {config.risk.max_position_loss_pct}")
+        failures += 1
     print(f"  config values: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -271,6 +297,7 @@ def test_config_backwards_compatible() -> int:
         print(f"  FAIL default symbols: {config.trading.symbols}")
         failures += 1
     print(f"  config backwards compatibility: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -301,6 +328,7 @@ def test_config_rejects_bad_trading() -> int:
         except ValueError:
             pass
     print(f"  config rejection: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 

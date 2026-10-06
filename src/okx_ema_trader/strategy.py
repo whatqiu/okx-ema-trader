@@ -7,7 +7,7 @@ a backtest ends up measuring something the bot never trades.
 Shape of the decision:
 
     15m (closed bar) : direction + ADX + deviation  -> which side is ALLOWED
-    5m  (closed bar) : EMA20/EMA60 CROSSOVER EVENT  -> when to actually enter
+    5m  (closed bar) : EMA20/EMA50 CROSSOVER EVENT  -> when to actually enter
 
 Nothing else. 15m is a state (it stays true for many bars); 5m is an event (it is
 true on exactly one bar). That asymmetry is the whole point: without it, every
@@ -23,7 +23,7 @@ from dataclasses import dataclass
 REASON_WARMUP = "warmup"                         # not enough history (or no previous 5m bar)
 REASON_ADX = "adx_too_low"                       # 15m ADX <= adx_min
 REASON_DEVIATION = "deviation_too_large"         # 15m price too far from EMA20
-REASON_NO_ENV = "no_trend_env"                   # 15m EMA20 == EMA60, no direction
+REASON_NO_ENV = "no_trend_env"                   # 15m EMA20 == EMA50, no direction
 REASON_NO_CROSS = "no_cross_event"               # normal case: no 5m crossover on this bar
 
 
@@ -79,7 +79,7 @@ def classify(ind_5m: dict, ind_15m: dict, adx_min: float,
     if env == "short" and prev_fast >= prev_slow and fast_5m < slow_5m:
         return Signal("short", "15m bearish + 5m death cross"), "short"
 
-    # EMA20 sitting above EMA60 for many bars is NOT a signal. Only the flip is.
+    # EMA20 sitting above EMA50 for many bars is NOT a signal. Only the flip is.
     return None, REASON_NO_CROSS
 
 

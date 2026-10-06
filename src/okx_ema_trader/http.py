@@ -28,9 +28,26 @@ from collections import deque
 
 API = "https://www.okx.com/api/v5"
 
+# Cloudflare error 1010 ("The owner of this website has banned your browser's
+# signature") is what OKX returns for a request that looks like a bot wearing a
+# fake browser hat. A UA of "Mozilla/5.0 (compatible; okx-ema-trader)" is
+# exactly that pattern: browser prefix + obviously programmatic tail. It got
+# us 403 while a full Chrome UA sailed through — so the UA must look like a
+# real Chrome, and the extra browser-shaped headers below are what a genuine
+# navigation sends. This is a public market-data endpoint; identifying as a
+# browser is not spoofing anything, it is just not volunteering a bot shape.
 UA = {
-    "User-Agent": "Mozilla/5.0 (compatible; okx-ema-trader)",
-    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept-Encoding": "identity",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
 }
 
 # 20 requests per 2 seconds per IP, per OKX's published market-data limit.

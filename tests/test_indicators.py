@@ -93,6 +93,7 @@ def test_matches_pre_refactor_implementation() -> int:
                 print(f"    current ={current}")
                 print(f"    expected={expected}")
     print(f"  calculate_indicators vs frozen reference: {checks - failures}/{checks} identical")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -113,6 +114,7 @@ def test_prev_row_is_the_previous_bar() -> int:
             failures += 1
             print(f"  FAIL seed={seed}: prev_ema_slow is not frame.iloc[-2]")
     print(f"  prev bar equals frame.iloc[-2]: {checks - failures}/{checks} agree")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -128,6 +130,7 @@ def test_short_series_returns_empty() -> int:
         failures += 1
         print("  FAIL: indicator_frame should return an empty frame for short series")
     print("  short-series guard: ok" if failures == 0 else "  short-series guard: FAILED")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -145,6 +148,7 @@ def test_frame_last_row_equals_row_api() -> int:
             failures += 1
             print(f"  FAIL seed={seed}: frame tail disagrees with row API")
     print(f"  indicator_frame tail vs calculate_indicators: {checks - failures}/{checks} agree")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 

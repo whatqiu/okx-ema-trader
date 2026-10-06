@@ -91,9 +91,9 @@ def config() -> Config:
 
 def normalise_symbol(symbol: str) -> str:
     """`MU` / `MUUSDT` / `mu-usdt-swap` -> `MU-USDT-SWAP`."""
-    from okx_ema_trader.console_api import _normalise_symbol
+    from okx_ema_trader.symbols import normalise_symbol as _normalise
 
-    return _normalise_symbol(symbol or "")
+    return _normalise(symbol or "")
 
 
 def okx_get(path: str, params: dict | None = None, timeout: float = 15.0):

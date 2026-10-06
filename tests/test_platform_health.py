@@ -212,14 +212,14 @@ LIMITS = health.RiskLimits(enabled=True, max_loss_pct=60.0,
 
 
 def test_flat_position_never_triggers():
-    d = health.evaluate_risk([pos()], equity=10000, initial=10000, limits=LIMITS)
+    d = health.evaluate_risk([pos()], equity=10000, baseline=10000, limits=LIMITS)
     check(not d.should_close, "a fresh position must be left alone")
 
 
 def test_small_loss_is_within_tolerance():
     # -30 on 100 margin = -30%, under the 60% cap: noise, not a stop.
     d = health.evaluate_risk([pos(unrealised_pnl=-30.0)], equity=9970,
-                             initial=10000, limits=LIMITS)
+                             baseline=10000, limits=LIMITS)
     check(not d.should_close, "-30% of margin must not trip a 60% brake")
 
 
@@ -231,7 +231,7 @@ def test_position_stop_fires_on_margin_not_notional():
     'this position is dead'.
     """
     d = health.evaluate_risk([pos(unrealised_pnl=-61.0)], equity=9939,
-                             initial=10000, limits=LIMITS)
+                             baseline=10000, limits=LIMITS)
     check(d.should_close, "61% of margin gone -> must close")
     check(d.reason.startswith("position-stop"), f"reason: {d.reason}")
     check(d.detail["order_id"] == 1, "the offending order is named")
@@ -241,13 +241,13 @@ def test_position_stop_fires_on_margin_not_notional():
 def test_liquidation_proximity_fires_early():
     # mark 82 vs liq 80 -> 2.5% away, inside the 50%-of-liq-distance buffer.
     d = health.evaluate_risk([pos(mark_price=82.0, unrealised_pnl=-20.0)],
-                             equity=9980, initial=10000, limits=LIMITS)
+                             equity=9980, baseline=10000, limits=LIMITS)
     check(d.should_close, "close to the liq price must force an exit")
     check(d.reason.startswith("liquidation-risk"), f"reason: {d.reason}")
 
 
 def test_account_drawdown_closes_without_an_order_id():
-    d = health.evaluate_risk([pos()], equity=7000, initial=10000, limits=LIMITS)
+    d = health.evaluate_risk([pos()], equity=7000, baseline=10000, limits=LIMITS)
     check(d.should_close, "30% account drawdown trips a 25% limit")
     check(d.reason == "account-drawdown", f"reason: {d.reason}")
     check(d.detail.get("order_id") is None,
@@ -255,14 +255,14 @@ def test_account_drawdown_closes_without_an_order_id():
 
 
 def test_losing_streak_closes():
-    d = health.evaluate_risk([pos()], equity=10000, initial=10000,
+    d = health.evaluate_risk([pos()], equity=10000, baseline=10000,
                              limits=LIMITS, consecutive_losses=5)
     check(d.should_close, "5 losses in a row must stop the strategy")
     check(d.reason == "losing-streak", f"reason: {d.reason}")
 
 
 def test_one_loss_short_of_streak_does_not_fire():
-    d = health.evaluate_risk([pos()], equity=10000, initial=10000,
+    d = health.evaluate_risk([pos()], equity=10000, baseline=10000,
                              limits=LIMITS, consecutive_losses=4)
     check(not d.should_close, "4 < 5 must keep trading")
 
@@ -272,7 +272,7 @@ def test_disabled_breaker_never_fires():
                             max_daily_loss_pct=1.0, max_consecutive_losses=1,
                             liq_buffer_pct=99.0)
     d = health.evaluate_risk([pos(unrealised_pnl=-9999.0, mark_price=1.0)],
-                             equity=1, initial=10000, limits=off,
+                             equity=1, baseline=10000, limits=off,
                              consecutive_losses=99)
     check(not d.should_close, "a disabled breaker must not close anything")
 
@@ -281,7 +281,7 @@ def test_worst_position_is_the_one_reported():
     positions = [pos(id=1, unrealised_pnl=-20.0),
                  pos(id=2, unrealised_pnl=-80.0),
                  pos(id=3, unrealised_pnl=-30.0)]
-    d = health.evaluate_risk(positions, equity=9870, initial=10000, limits=LIMITS)
+    d = health.evaluate_risk(positions, equity=9870, baseline=10000, limits=LIMITS)
     check(d.detail["order_id"] == 2, "the worst loss decides the reason")
 
 
@@ -294,7 +294,7 @@ def test_two_positions_past_the_cap_are_both_condemned():
     """
     positions = [pos(id=1, unrealised_pnl=-70.0),
                  pos(id=2, unrealised_pnl=-75.0)]
-    d = health.evaluate_risk(positions, equity=9855, initial=10000, limits=LIMITS)
+    d = health.evaluate_risk(positions, equity=9855, baseline=10000, limits=LIMITS)
     check(d.should_close, "both are past the cap")
     check(d.detail["condemned"] == [1, 2],
           f"both must be condemned, got {d.detail.get('condemned')}")
@@ -302,7 +302,7 @@ def test_two_positions_past_the_cap_are_both_condemned():
 
 def test_one_failing_position_does_not_condemn_the_healthy_one():
     positions = [pos(id=1, unrealised_pnl=-70.0), pos(id=2, unrealised_pnl=-1.0)]
-    d = health.evaluate_risk(positions, equity=9929, initial=10000, limits=LIMITS)
+    d = health.evaluate_risk(positions, equity=9929, baseline=10000, limits=LIMITS)
     check(d.detail["condemned"] == [1], "only the offender is condemned")
 
 
@@ -366,6 +366,13 @@ def test_account_drawdown_closes_every_position():
                             price=100.0)
         paper.open_position(store, other, "long", notional=5000.0, leverage=5.0,
                             price=50.0)
+        # The brake was already running while the account was healthy, which is
+        # what pins the drawdown baseline (`health.risk_baseline`) near 10000.
+        # Skipping this pass would pin it AFTER the crash instead, and a brake
+        # that takes its reference from the crash it is supposed to catch sees a
+        # drawdown of zero.
+        health.enforce_risk(store, limits=LIMITS,
+                            marks={INST: 100.0, other: 50.0})
         # Both at ~40% down: equity 10000 -> ~4000, a 60% account drawdown.
         report = health.enforce_risk(
             store, limits=LIMITS,

@@ -6,7 +6,7 @@ candle_limit: 200
 
 strategy:
   ema_fast: 20
-  ema_slow: 60
+  ema_slow: 50
   adx_period: 14
   # ADX 必须严格大于该值：adx <= adx_min 即无信号。
   adx_min: 20
@@ -38,3 +38,21 @@ trading:
   stop_loss_pct: 3.0
   max_total_notional: 100000   # 满仓模式下敞口随权益放大，上限相应放宽
   position_mode: cross
+
+# 账户级熔断。只对"会真下单的那条路径"生效（executor.py）；策略判定完全不
+# 参与。触发后平仓并停手，halt 会写进 state.yaml，重启不解除，需要人工
+# `--reset-halt`（或手改 state.yaml 的 risk 段）。
+#
+# 三个阈值都能省略：省略 = 用代码默认 / 按 stop_loss_pct × leverage 自动推导。
+# 省略（None）和写 0 是两回事：0 = 明确关掉这一条，None = 我没意见。
+#
+# 回撤基准是"历史最高权益"（持久化在 state.yaml 的 risk.peak_equity）——
+# 不是"今天"，也不是"这次启动"：重启不会把已经亏掉的部分变回额度。
+risk:
+  # 账户回撤上限，自历史最高权益起算。60 ≈ 两次满仓 10x 止损（2 × 30%），
+  # 第三次之前停手。想一次止损就停手就写 30。
+  max_drawdown_pct: 60
+  # 连续亏损笔数上限。平仓时才知道盈亏，所以这个计数平仓后才更新。
+  max_consecutive_losses: 3
+  # max_position_loss_pct 省略 = 由 stop_loss_pct × leverage 自动推导（3 × 10 = 30）。
+  # 这一条通常是"止损没挂上或跳空穿了"的信号，触发即停手。

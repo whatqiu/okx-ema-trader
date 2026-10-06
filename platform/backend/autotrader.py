@@ -32,6 +32,7 @@ import math
 import time
 
 import deps
+import health
 import market
 import paper
 from okx_ema_trader.backtest import MINUTES_PER_BAR
@@ -105,6 +106,11 @@ def get_state(store) -> dict:
                                             str(DEFAULT_MAX_POSITIONS))),
         "last_action": store.get_meta("auto_last_action", ""),
         "last_error": store.get_meta("auto_last_error", ""),
+        # Surfaced here as well as in /api/status: the auto-trade panel is where
+        # a user lands when the bot "won't trade any more", and a halt is by far
+        # the most likely reason.
+        "halted": health.risk_halted(store),
+        "halt_reason": health.risk_halt_state(store)["reason"],
         # Per-symbol last evaluation, including WHY there was no signal. Without
         # this, an empty `signals` table cannot distinguish "the strategy never
         # triggers" from "the loop never ran".
@@ -186,15 +192,21 @@ def ensure_data(store, inst_id: str) -> bool:
 
 
 def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
-                ticker_fn=None, allow_open: bool = True) -> dict:
+                ticker_fn=None, allow_open: bool = True,
+                halted: bool = False) -> dict:
     """Evaluate the newest confirmed bar once for ONE symbol; act on a signal.
 
     Injectable seams (`signal_fn`, `price_fn`, `ticker_fn`) keep this testable
     offline: the decision path and the accounting are what we pin down, not
     OKX's mood.
 
-    `allow_open` is the capacity gate owned by `maybe_trade_all`. Closing an
-    opposite position is always allowed — reducing risk never needs permission.
+    `allow_open` is the capacity gate owned by `maybe_trade_all`, and `halted`
+    is the circuit breaker's gate. They are NOT the same gate and must not be
+    merged: at the cap a reversal is still allowed because its close half frees
+    the slot, whereas under a halt nothing new may be opened at all — flipping
+    short to long would be adding exposure through the back door. Closing an
+    opposite position is allowed under both: reducing risk never needs
+    permission.
     """
     signal_fn = signal_fn or evaluate_signal
     cfg = deps.config()
@@ -292,16 +304,20 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
     same = [o for o in opens if o["side"] == side]
     opposite = [o for o in opens if o["side"] != side]
 
-    # Closing an opposite position always frees the slot it occupies, so it is
-    # allowed even at the cap: reducing risk never needs permission, only
-    # adding exposure does. Blocking the close here would strand a position the
-    # strategy has explicitly said to reverse.
-    can_open = allow_open or bool(opposite)
-    if not same and not can_open:
+    # Skipped only when there is nothing to reduce AND nothing may be added. A
+    # pending reversal still has to reach the block below so its close half can
+    # run — stranding a position the strategy has explicitly reversed would be
+    # leaving risk on precisely when the brake is asking for less of it.
+    if not same and not opposite and (halted or not allow_open):
+        if halted:
+            why, out_why = "风控已熔断，暂停开仓", "risk halt"
+        else:
+            why = f"持仓已达上限 {state['max_positions']}，跳过开仓"
+            out_why = "at position cap"
         _record_scan(store, inst_id, ts=last_ts, side=side, acted=False, adx=adx,
-                     why=f"持仓已达上限 {state['max_positions']}，跳过开仓")
-        return {"acted": False, "why": "at position cap", "signal": side,
-                "bar_ts": last_ts, "inst_id": inst_id}
+                     why=why)
+        return {"acted": False, "why": out_why, "signal": side,
+                "bar_ts": last_ts, "inst_id": inst_id, "halted": halted}
 
     closed, opened = [], None
     try:
@@ -312,7 +328,7 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
             exit_price = prices["bid"] if o["side"] == "long" else prices["ask"]
             out = paper.close_position(store, o["id"], exit_price)
             closed.append({"id": o["id"], "pnl": out["pnl"]})
-        if not same:
+        if not same and not halted:
             entry = prices["ask"] if side == "long" else prices["bid"]
             opened = paper.open_position(store, inst_id, side,
                                          state["notional"], state["leverage"],
@@ -322,9 +338,12 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
                          price=prices.get("last"), ema_fast=float(r5["ema_fast"]),
                          ema_slow=float(r5["ema_slow"]), adx=adx,
                          ts=last_ts, acted=acted)
+        # Spelled out because the scan table is the only place a user can see
+        # why a live signal did not become a position.
+        why = (f"{signal.reason}｜熔断中，只平反向仓不开新仓" if halted
+               else signal.reason)
         _record_scan(store, inst_id, ts=last_ts, side=side, acted=acted, adx=adx,
-                     why=signal.reason,
-                     opened=bool(opened), closed=len(closed))
+                     why=why, opened=bool(opened), closed=len(closed))
         stamp = time.strftime("%m-%d %H:%M")
         _record(store, "auto_last_action",
                 f"{stamp} {inst_id} {side} 信号: 平{len(closed)} 开{1 if opened else 0}")
@@ -357,18 +376,17 @@ def maybe_trade_all(store, *, signal_fn=None, price_fn=None,
     One symbol's failure is contained on purpose: with a watch list, a single
     instrument that 404s, has no bid/ask, or has thin candles would otherwise
     abort the scan and silently stop trading every OTHER symbol too.
-    """
-    """Scan every watched symbol and act on whichever ones have a signal.
 
-    One symbol's failure is contained on purpose: with a watch list, a single
-    instrument that 404s, has no bid/ask, or has thin candles would otherwise
-    abort the scan and silently stop trading every OTHER symbol too.
+    `halted` (the latched circuit breaker) blocks every OPEN in this pass while
+    still letting reversals close — see `maybe_trade`.
     """
     state = get_state(store)
     symbols = state["symbols"]
+    halted = health.risk_halted(store)
     if not state["enabled"] or not symbols:
         return {"scanned": 0, "results": [], "why": "disabled or no symbols",
-                "enabled": state["enabled"], "symbols": symbols}
+                "enabled": state["enabled"], "symbols": symbols,
+                "halted": halted}
 
     # Cleared once per pass, never per symbol: see the note in `maybe_trade`.
     # This way `last_error` means "something in THIS scan failed", and a later
@@ -381,7 +399,7 @@ def maybe_trade_all(store, *, signal_fn=None, price_fn=None,
     for inst in symbols:
         # Capacity is re-evaluated per symbol: an earlier symbol in the list
         # may have opened something, so "allowed" can flip mid-scan.
-        allow_open = open_count < cap
+        allow_open = open_count < cap and not halted
         try:
             # Self-healing: a symbol added to the watch list five seconds ago
             # has no candles yet, and one whose poller entry was lost has stale
@@ -390,7 +408,7 @@ def maybe_trade_all(store, *, signal_fn=None, price_fn=None,
                 ensure_data(store, inst)
             res = maybe_trade(store, inst, signal_fn=signal_fn,
                               price_fn=price_fn, ticker_fn=ticker_fn,
-                              allow_open=allow_open)
+                              allow_open=allow_open, halted=halted)
         except Exception as exc:  # noqa: BLE001 - one bad symbol, not the scan
             _record_scan(store, inst, ts=0, side=None, acted=False,
                          why=f"scan error: {type(exc).__name__}: {exc}")
@@ -401,7 +419,7 @@ def maybe_trade_all(store, *, signal_fn=None, price_fn=None,
         results.append(res)
     acted = [r for r in results if r.get("acted")]
     return {"scanned": len(symbols), "results": results, "acted": len(acted),
-            "enabled": True, "symbols": symbols}
+            "enabled": True, "symbols": symbols, "halted": halted}
 
 
 def _spread_prices(store, inst_id: str, ticker_fn=None) -> dict:

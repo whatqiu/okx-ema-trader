@@ -1,6 +1,16 @@
+# Core — CLI, strategy, backtest, executor
 ccxt>=4.5.0
 pandas>=2.2.0,<4.0
 numpy>=1.26.0
 pyyaml>=6.0
-python-dotenv>=1.0.0
 websockets>=12.0
+requests>=2.31.0
+
+# Trading platform — platform/ (FastAPI backend + SQLite + Vue frontend)
+fastapi>=0.110
+uvicorn>=0.27
+
+# Optional, one entry point each:
+#   pywebview>=5.0    start-platform-desktop.bat (native window instead of a browser)
+#   matplotlib>=3.8   fetch_mu_candles.py — plotting. Without them the script
+#   mplfinance>=0.12  still exports the CSV and just skips the chart.

@@ -26,7 +26,8 @@ import paper
 import autotrader
 import health
 from okx_ema_trader.backtest import MINUTES_PER_BAR, simulate
-from okx_ema_trader.console_server import _json_safe
+from okx_ema_trader.jsonio import json_safe as _json_safe
+from okx_ema_trader.symbols import SymbolError
 from okx_ema_trader.http import OkxError
 from okx_ema_trader.indicators import indicator_frame
 
@@ -100,6 +101,48 @@ def _run_risk_check(store) -> dict:
     return report
 
 
+def _auto_pass() -> None:
+    """One iteration of the auto loop, split out so a test can run exactly one.
+
+    The ORDER IS THE FIX. The brake used to sit after the `continue` taken when
+    auto-trading was off or the watch list was empty — the two states where it
+    matters most: a position opened by hand from /api/trade/open, or one left
+    running overnight with the switch off, had NO circuit breaker at all while
+    the badge stayed green. The comment there claimed otherwise; the code now
+    matches the comment.
+    """
+    try:
+        store = deps.store()
+        # 1. The brake, first and unconditionally. Its own try because step 2
+        #    can fail on its own: a corrupt `auto_symbols` row must not cost the
+        #    account its only protection. Fails CLOSED — a pass that could not
+        #    run the brake must not let the strategy add exposure. The next pass
+        #    retries in 15s.
+        try:
+            _run_risk_check(store)
+        except Exception as exc:
+            _auto_health.fail(f"风控检查失败: {type(exc).__name__}: {exc}")
+            return
+        # 2. The strategy. Reading the watch list is a separate concern and a
+        #    separate failure, deliberately — see above.
+        state = autotrader.get_state(store)
+        symbols = state["symbols"]
+        if not state["enabled"] or not symbols:
+            # Nothing to trade, so this pass dialled out to nobody. Record
+            # the loop as alive but do NOT claim a successful contact:
+            # `idle()` leaves `last_ok_at` alone so a real outage still
+            # shows up in the badge while auto-trading is off.
+            _auto_health.idle()
+            return
+        autotrader.maybe_trade_all(store)
+        _auto_health.ok()
+    except Exception as exc:
+        # Recorded, not swallowed. The previous `except Exception: continue`
+        # kept the loop alive but erased the reason, which made an outage
+        # indistinguishable from a quiet market.
+        _auto_health.fail(f"{type(exc).__name__}: {exc}")
+
+
 def _auto_loop() -> None:
     """Every 15s: enforce risk, then scan every watched symbol for a signal.
 
@@ -109,28 +152,7 @@ def _auto_loop() -> None:
     looking like an idle market.
     """
     while not _auto_stop.wait(15.0):
-        store = None
-        try:
-            store = deps.store()
-            state = autotrader.get_state(store)
-            symbols = state["symbols"]
-            if not state["enabled"] or not symbols:
-                # Nothing to trade, so this pass dialled out to nobody. Record
-                # the loop as alive but do NOT claim a successful contact:
-                # `idle()` leaves `last_ok_at` alone so a real outage still
-                # shows up in the badge while auto-trading is off.
-                _auto_health.idle()
-                continue
-            # The brake does not care whether the strategy is switched on: an
-            # open position left unattended is exactly the case it exists for.
-            _run_risk_check(store)
-            autotrader.maybe_trade_all(store)
-            _auto_health.ok()
-        except Exception as exc:
-            # Recorded, not swallowed. The previous `except Exception: continue`
-            # kept the loop alive but erased the reason, which made an outage
-            # indistinguishable from a quiet market.
-            _auto_health.fail(f"{type(exc).__name__}: {exc}")
+        _auto_pass()
 
 
 def _watchdog_loop() -> None:
@@ -186,11 +208,17 @@ app = FastAPI(title="okx-ema-trader platform", lifespan=lifespan)
 # Helpers
 # --------------------------------------------------------------------------
 def _symbol(raw: str | None) -> str:
-    """Normalise or 400 — never let a typo'd symbol become an OKX round-trip."""
-    symbol = deps.normalise_symbol(raw or "")
-    if not symbol:
-        raise HTTPException(400, f"无法识别的交易对：{raw!r}（示例：MU 或 MU-USDT-SWAP）")
-    return symbol
+    """Normalise or 400 — never let a typo'd symbol become an OKX round-trip.
+
+    `normalise_symbol` signals a bad symbol by RAISING, never by returning "".
+    The `if not symbol` guard that used to sit here was therefore dead code: the
+    exception escaped and a typo came back as a 500 with a traceback. Catch it
+    and answer 400, which is what a malformed query parameter actually is.
+    """
+    try:
+        return deps.normalise_symbol(raw or "")
+    except SymbolError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _bar(raw: str | None) -> str:
@@ -324,7 +352,7 @@ def instruments(q: str = "", limit: int = Query(30, ge=1, le=100)):
 @app.get("/api/orders")
 def orders(symbol: str | None = None, status: str | None = None,
            limit: int = Query(100, ge=1, le=1000)):
-    inst = deps.normalise_symbol(symbol) if symbol else None
+    inst = _symbol(symbol) if symbol else None
     if status not in (None, "open", "closed"):
         raise HTTPException(400, "status 只能是 open / closed")
     rows = deps.store().orders(limit=limit, inst_id=inst, status=status)
@@ -333,7 +361,7 @@ def orders(symbol: str | None = None, status: str | None = None,
 
 @app.get("/api/signals")
 def signals(symbol: str | None = None, limit: int = Query(100, ge=1, le=1000)):
-    inst = deps.normalise_symbol(symbol) if symbol else None
+    inst = _symbol(symbol) if symbol else None
     return _json_safe({"rows": deps.store().signals(limit=limit, inst_id=inst)})
 
 
@@ -473,6 +501,7 @@ def health_status():
     market_h = _market_health.snapshot()
     auto_h = _auto_health.snapshot()
     connected = bool(market_h["connected"] and auto_h["loop_alive"])
+    halt = health.risk_halt_state(store)
     return _json_safe({
         "connected": connected,
         "market": market_h,
@@ -486,7 +515,14 @@ def health_status():
                 "liq_buffer_pct": RISK_LIMITS.liq_buffer_pct,
             },
             "last": _last_risk,
-            "losing_streak": health.consecutive_losses(store),
+            # The streak the brake actually judges (counted from the last manual
+            # reset), not the raw one — see health.losing_streak.
+            "losing_streak": health.losing_streak(store),
+            # Latched "stop opening". Sits beside `last` rather than inside it
+            # because it is true ACROSS passes, not the result of one pass.
+            "halted": halt["halted"],
+            "halt_reason": halt["reason"],
+            "halt_at": halt["at"],
         },
     })
 
@@ -496,6 +532,27 @@ def risk_check():
     """Run the circuit breaker now, on demand. Same path the loop uses."""
     report = _run_risk_check(deps.store())
     return _json_safe(report)
+
+
+@app.post("/api/risk/reset")
+def risk_reset():
+    """Lift a latched halt by hand.
+
+    Without this the halt is a lockout: the brake trips once, silently refuses
+    every future entry, and the user is left asking why the bot "broke". Clearing
+    is a deliberate human act and it re-bases the losing-streak counter — see
+    `health.clear_risk_halt` for why that re-base is not optional.
+    """
+    global _last_risk
+    store = deps.store()
+    state = health.clear_risk_halt(store)
+    # The cached report is what the badge and the banner render. Leaving
+    # `halted: true` in it would keep the UI accusing a brake that was just
+    # cleared, until the next pass overwrote it.
+    with _risk_lock:
+        _last_risk = {**(_last_risk or {}), "halted": state["halted"],
+                      "halt_reason": state["reason"], "halt_at": state["at"]}
+    return _json_safe({"ok": True, **state})
 
 
 @app.get("/api/account")
@@ -559,7 +616,15 @@ class AccountResetRequest(BaseModel):
 
 @app.post("/api/account/reset")
 def account_reset(req: AccountResetRequest):
-    paper.reset_account(deps.store(), req.balance)
+    store = deps.store()
+    paper.reset_account(store, req.balance)
+    # A fresh balance must get a fresh drawdown baseline. Keeping the old one
+    # would open the new account already deep in a "drawdown" against money
+    # that never existed, and the brake would latch on the first pass.
+    health.clear_risk_baseline(store)
+    # Same reasoning as the baseline: the losing streak that sank the old
+    # account is not something the new one did.
+    health.clear_risk_halt(store)
     return {"ok": True, "balance": req.balance}
 
 

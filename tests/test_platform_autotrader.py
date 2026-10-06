@@ -44,7 +44,7 @@ def fresh_store():
 
 
 def seed_candles(store, n5: int = 120, n15: int = 60, price: float = 100.0):
-    """Enough confirmed bars to clear indicator warmup (ema_slow=60).
+    """Enough confirmed bars to clear indicator warmup (ema_slow=50).
 
     Prices must MOVE: perfectly flat synthetic bars give +DM == -DM == 0,
     so Wilder's DX divides 0 by 0 and ADX is NaN forever. Real markets

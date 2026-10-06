@@ -62,6 +62,7 @@ def test_entry_fires_once_not_every_bar() -> int:
             failures += 1
 
     print(f"  entry fires once: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -83,6 +84,7 @@ def test_death_cross_is_the_mirror_case() -> int:
             failures += 1
 
     print(f"  death cross mirror: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -99,6 +101,7 @@ def test_15m_is_a_state_not_an_event() -> int:
         print(f"  FAIL 15m state should permit the long: {signal}")
         failures += 1
     print(f"  15m is a state: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -123,6 +126,7 @@ def test_deviation_boundary() -> int:
             print(f"  FAIL {label}: expected pass={should_pass}, got {signal}")
             failures += 1
     print(f"  deviation boundary: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -136,6 +140,7 @@ def test_deviation_is_15m_only() -> int:
         print(f"  FAIL 5m deviation must be irrelevant: {signal}")
         failures += 1
     print(f"  deviation is 15m only: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -148,6 +153,7 @@ def test_adx_gate_is_strict() -> int:
             print(f"  FAIL ADX={adx}: expected pass={should_pass}, got {signal}")
             failures += 1
     print(f"  ADX strict gate: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -205,6 +211,7 @@ def test_backtest_calls_the_same_function() -> int:
         print("  FAIL: backtest imported a different function object")
         failures += 1
     print(f"  backtest binds the shared function: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -258,6 +265,7 @@ def test_every_backtest_entry_is_a_strategy_signal() -> int:
             failures += 1
 
     print(f"  {len(entry_ts)} entries all justified: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -312,6 +320,7 @@ def test_entry_uses_next_bar_open() -> int:
 
     print(f"  next-bar open fill (signal {close_signal_bar:.2f} -> fill {gap_open:.2f}): "
           f"{'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -345,6 +354,7 @@ def test_signal_on_last_bar_is_never_filled() -> int:
         failures += 1
 
     print(f"  last-bar signal not filled: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -380,6 +390,7 @@ def test_no_lookahead_bias() -> int:
         failures += 1
     print(f"  no look-ahead ({len(entries_cut)} entries stable): "
           f"{'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -409,6 +420,7 @@ def test_stop_loss_is_actually_simulated() -> int:
 
     print(f"  stop simulated (tight={tight.stopped_out}, wide={wide.stopped_out}): "
           f"{'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
@@ -437,6 +449,7 @@ def test_stop_exits_are_conservative() -> int:
                 print(f"  FAIL short stop filled below the stop: {t.exit_price} < {limit}")
                 failures += 1
     print(f"  {len(stops)} stop exits conservative: {'ok' if not failures else 'FAILED'}")
+    assert failures == 0, f"{failures} check(s) failed"
     return failures
 
 
