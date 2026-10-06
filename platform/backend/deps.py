@@ -70,19 +70,29 @@ def proxy() -> str | None:
     """The proxy every outbound OKX call uses.
 
     Precedence: explicit setting ("" means direct) -> Windows system proxy ->
-    None. Resolved once and cached: `winreg` on every request is wasteful, and
-    if the user changes the setting we clear the cache in `save_settings`.
+    None.
+
+    The explicit setting is cached, because changing it can only go through
+    `save_settings`, which invalidates. The system proxy is deliberately NOT
+    cached: it is "whichever proxy client is running right now", and this
+    machine has TWO, on different ports — the client rewrites the registry
+    when it starts, so a cached answer goes stale the moment the user switches
+    clients. That staleness is exactly the failure that took an afternoon to
+    diagnose (platform cached one client's port; the other client was up).
+    A `winreg` read is a local registry lookup measured in microseconds and
+    the poller calls this at most a few times a second — caching it saves
+    nothing and costs diagnosability.
     """
     global _proxy_override
-    if _proxy_override is False:
-        settings = load_settings()
-        if "proxy" in settings:
-            # An explicit "" is a deliberate choice to go direct, which is
-            # different from never having configured it.
-            _proxy_override = settings.get("proxy") or None
-        else:
-            _proxy_override = okx_http.system_proxy()
-    return _proxy_override  # type: ignore[return-value]
+    if _proxy_override is not False:
+        return _proxy_override  # type: ignore[return-value]
+    settings = load_settings()
+    if "proxy" in settings:
+        # An explicit "" is a deliberate choice to go direct, which is
+        # different from never having configured it.
+        _proxy_override = settings.get("proxy") or None
+        return _proxy_override  # type: ignore[return-value]
+    return okx_http.system_proxy()
 
 
 def config() -> Config:

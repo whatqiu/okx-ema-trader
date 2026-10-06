@@ -207,6 +207,9 @@ async def lifespan(app: FastAPI):
     global _poller
     _configure_logging()
     log.info("platform 启动：pid=%s", os.getpid())
+    # Log the effective outbound path once: when every OKX call 502s, the first
+    # question is always "which proxy is it trying?" — answer it up front.
+    log.info("OKX 出网代理：%s", deps.proxy() or "直连（未配置代理）")
     _poller = market.MarketPoller(deps.store(), interval=5.0)
     _poller.start()
     # Re-subscribe on boot. The watch list lives in the database; the poller's

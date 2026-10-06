@@ -188,7 +188,15 @@ def get_json(path: str, params: dict | None = None, *, proxy: str | None = None,
         # None of these is "your proxy is broken".
         raise OkxError(f"OKX 返回 HTTP {exc.code} for {path}", "http", exc.code) from exc
     except Exception as exc:
-        raise OkxError(f"连不上 OKX（{type(exc).__name__}: {exc}）", "network") from exc
+        # Name the target: "connection refused" means the thing being refused
+        # is almost always the PROXY (a dead local client), and the fastest
+        # diagnosis is the error message itself saying which address was tried.
+        # A bare "连不上 OKX" sends people to debug their VPN when the real
+        # bug is a stale port saved in a settings file.
+        detail = f"{type(exc).__name__}: {exc}"
+        if proxy:
+            raise OkxError(f"经代理 {proxy} 连不上 OKX（{detail}）", "network") from exc
+        raise OkxError(f"直连 OKX 失败，当前没有配置任何代理（{detail}）", "network") from exc
 
     try:
         payload = json.loads(body)
