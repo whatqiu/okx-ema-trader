@@ -11,9 +11,12 @@ Run from this directory:
 """
 from __future__ import annotations
 
+import logging
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -33,6 +36,35 @@ from okx_ema_trader.indicators import indicator_frame
 
 _poller: market.MarketPoller | None = None
 _auto_stop = threading.Event()
+
+log = logging.getLogger("platform")
+
+
+def _configure_logging() -> None:
+    """Give the backend a log file, so a failure survives the console scrollback.
+
+    Until this existed the only trace of an upstream failure was the HTTP status
+    uvicorn printed (`502` with no reason): `OkxError` carries *why* it failed —
+    connection reset, Cloudflare 403, rate limit — and that was thrown away on
+    the way to the response body. A trading process that cannot tell you why it
+    stopped quoting prices is not debuggable.
+
+    Attached to the ROOT logger on purpose: uvicorn's own access/error records
+    land in the same file, so there is one place to look instead of two.
+
+    Idempotent because `lifespan` runs once per TestClient and a second
+    FileHandler would double every line.
+    """
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    if any(isinstance(handler, logging.FileHandler) for handler in root.handlers):
+        return
+    directory = Path(__file__).resolve().parents[2] / "logs"
+    directory.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(directory / "platform.log", encoding="utf-8")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s | %(message)s"))
+    root.addHandler(handler)
 _janitor_stop = threading.Event()
 _prune_lock = threading.Lock()
 JANITOR_INTERVAL_S = 6 * 3600
@@ -173,6 +205,8 @@ def _watchdog_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _poller
+    _configure_logging()
+    log.info("platform 启动：pid=%s", os.getpid())
     _poller = market.MarketPoller(deps.store(), interval=5.0)
     _poller.start()
     # Re-subscribe on boot. The watch list lives in the database; the poller's
@@ -230,15 +264,26 @@ def _bar(raw: str | None) -> str:
     return bar
 
 
-def _okx(call):
+def _okx(call, label: str = ""):
     """Translate the three OkxError kinds into three different HTTP answers,
-    because 'wrong symbol' and 'proxy dead' must not look identical to the UI."""
+    because 'wrong symbol' and 'proxy dead' must not look identical to the UI.
+
+    `label` says WHAT was being fetched (usually the symbol) and exists only so
+    the log line names the instrument. Without it a 502 in the uvicorn access
+    log is unattributable when four symbols are polled on the same tick.
+    """
     try:
         return call()
     except OkxError as exc:
         status = {"network": 502, "http": 502, "api": 400}.get(exc.kind, 502)
+        # Log before raising: the status code alone is what uvicorn prints, and
+        # "502" does not say whether to fix the proxy, wait out a rate limit, or
+        # drop a delisted symbol. kind/status are the whole diagnosis.
+        log.warning("OKX 失败 [%s] -> HTTP %s | kind=%s status=%s | %s",
+                    label or "?", status, exc.kind, exc.status, exc)
         raise HTTPException(status, str(exc)) from exc
     except ValueError as exc:
+        log.warning("OKX 参数错误 %s-> HTTP 400 | %s", label or "?", exc)
         raise HTTPException(400, str(exc)) from exc
 
 
@@ -315,7 +360,7 @@ def ticker(symbol: str = Query(...)):
             age_ms = int(time.time() * 1000) - int(cached["ts"])
             if age_ms < 15_000:
                 return _json_safe(cached)
-    tick = _okx(lambda: market.fetch_ticker(store, inst))
+    tick = _okx(lambda: market.fetch_ticker(store, inst), label=f"ticker {inst}")
     return _json_safe(tick)
 
 
@@ -424,8 +469,10 @@ def autotrade_set(patch: AutoTradePatch):
             # Backfill once, then let the poller keep it fresh at bar
             # boundaries. Watching is what stops the scan from re-fetching
             # history every 15 seconds for every symbol.
-            _okx(lambda i=inst: market.ensure_candles(store, i, cfg.bar_5m, 400))
-            _okx(lambda i=inst: market.ensure_candles(store, i, cfg.bar_15m, 200))
+            _okx(lambda i=inst: market.ensure_candles(store, i, cfg.bar_5m, 400),
+                 label=f"candles {inst} 5m")
+            _okx(lambda i=inst: market.ensure_candles(store, i, cfg.bar_15m, 200),
+                 label=f"candles {inst} 15m")
             _watch(inst, cfg.bar_5m)
             _watch(inst, cfg.bar_15m)
         autotrader.maybe_trade_all(store)
@@ -573,7 +620,7 @@ class TradeOpenRequest(BaseModel):
 def trade_open(req: TradeOpenRequest):
     inst = _symbol(req.symbol)
     store = deps.store()
-    tick = _okx(lambda: market.fetch_ticker(store, inst))
+    tick = _okx(lambda: market.fetch_ticker(store, inst), label=f"ticker {inst}")
     # Cross the spread like a real market order: long pays ask, short hits bid.
     side = req.side.lower()
     price = tick["ask"] if side == "long" else tick["bid"]
@@ -598,7 +645,8 @@ def trade_close(req: TradeCloseRequest):
     order = next((o for o in store.open_orders() if o["id"] == req.order_id), None)
     if order is None:
         raise HTTPException(404, f"持仓 #{req.order_id} 不存在或已平仓")
-    tick = _okx(lambda: market.fetch_ticker(store, order["inst_id"]))
+    tick = _okx(lambda: market.fetch_ticker(store, order["inst_id"]),
+                 label=f"ticker {order['inst_id']}")
     # Exit crosses the spread the other way: long sells at bid, short buys at ask.
     price = tick["bid"] if order["side"] == "long" else tick["ask"]
     if not price:
