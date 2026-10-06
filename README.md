@@ -1,305 +1,367 @@
-# OKX EMA Trader
+# okx-ema-trader
 
-EMA20/EMA50 + ADX 的趋势跟随策略，跑在 OKX 永续合约上。
+EMA 趋势跟随 + 账户级风控的永续合约交易系统。FastAPI + Vue3 交易平台，
+信号与执行分离，回测与实盘共用同一份策略代码。
 
-**下单只走 OKX Demo 模拟盘**：`credentials.py` 拒绝非 demo profile，`Broker` 强制 sandbox
-并校验 `x-simulated-trading` 头，因此不存在"误连实盘"的路径。回测与实盘调用同一份
-`strategy.classify()`，不会漂移。
+> **先看结论：这套策略目前没有正期望，不适合上实盘。**
+> 用本地 23 天真实 K 线测出 28 笔交易，毛收益全部为负（MU −16%、ZEC −30%），
+> 也就是**在扣手续费之前就是亏的**。详细数据和自查方法见 [策略有没有效](#策略有没有效)。
+> 这个仓库的价值在风控、回测纪律和工程结构，不在 alpha。
+>
+> 下面的数字是 2026-10-06 的快照，会随 K 线增长缓慢变化；`gross` 一直为负这个
+> 结论不会因为多几根 K 线而翻转。跑 `tools/evaluate_edge.py` 拿你自己的数。
 
-只读公共行情（回测、盯信号、查价格）不需要 API Key；只有 executor 和控制台的交易功能需要
-demo 凭证。
+---
 
-## 运行
+## 目录
+
+- [快速开始](#快速开始)
+- [策略有没有效](#策略有没有效) ← **先读这个**
+- [策略逻辑](#策略逻辑)
+- [风控](#风控)
+- [交易平台](#交易平台)
+- [回测方法论](#回测方法论)
+- [项目结构](#项目结构)
+- [测试](#测试)
+- [已知限制](#已知限制)
+
+---
+
+## 快速开始
 
 ```bat
-cd /d F:\Claude\okx-ema-trader
-.venv\Scripts\activate
+git clone <repo> && cd okx-ema-trader
+python -m venv .venv && .venv\Scripts\activate
+pip install -r requirements.txt
 set PYTHONPATH=src
-python -m okx_ema_trader.main
 ```
 
-依赖见 `requirements.txt`（画图用的 `matplotlib` / `mplfinance` 是可选依赖，见文末）。
-
-一键启动器（根目录，双击即可）：
-
-| 文件 | 作用 |
+| 命令 | 作用 |
 |---|---|
-| `start-platform.bat` | 交易平台 <http://127.0.0.1:8788>（FastAPI + 前端，端口占用时直接复用已运行的实例） |
-| `start-platform-desktop.bat` | 同上，但开一个原生窗口（`pythonw`，无控制台，自动选空闲端口） |
+| `start-platform.bat` | 启动交易平台 <http://127.0.0.1:8788> |
+| `python -m okx_ema_trader.backtest --days 90` | 回测（需出网） |
+| `python -m okx_ema_trader.tools.evaluate_edge` | 用本地库评估，见下文 |
+| `python -m okx_ema_trader.executor --dry-run` | 只观察信号，不下单 |
+| `python -m okx_ema_trader.executor` | OKX **模拟盘**自动交易 |
 
-等价的命令行（`.bat` 只是包了一层，方便不看终端的用法）：
+**只读行情（回测/看价/查信号）不需要 API Key**，只有 `executor` 的下单功能需要。
 
-- 盯信号：`python -m okx_ema_trader.monitor --symbol AAVE-USDT-SWAP`
-- 实时 WS 观察者：`python -m okx_ema_trader.main`
-- 回测：`python -m okx_ema_trader.backtest --days 90`
-- 自动交易 demo 盘：`python -m okx_ema_trader.executor`（先加 `--dry-run`，只观察不下单）
+### 出网代理
 
-## 数据链路
+OKX 公共行情在部分网络下需要代理。`--proxy` 留空时自动读 Windows 系统代理：
 
-1. 启动时先通过 REST `GET /api/v5/market/candles` 拉 200 根历史 K 线预热，指标立即可用，无需等十几个小时。
-2. 再连 WebSocket `wss://ws.okx.com:8443/ws/v5/business` 订阅 `candle5m` / `candle15m`。
-   > K 线频道在 **business** 端点，public 端点会返回 `60018 channel doesn't exist`。
-3. 每次重连都会重新预热一次，补齐断线期间收掉的 K 线。
+```bat
+python -m okx_ema_trader.backtest --proxy http://127.0.0.1:7890
+python -m okx_ema_trader.backtest --proxy ""              rem 强制直连
+```
 
-## 当前信号逻辑
+> **踩过的坑**：`config/console.json` 里曾硬编码了一个已停用代理软件的端口，
+> 表现为所有行情接口 502，而重启服务毫无帮助——因为坏值持久化在磁盘上。
+> 现在代理默认跟随系统设置、且**不缓存**，改完立即生效。
 
-**15m 提供方向环境（状态），5m 提供入场时机（事件）。** 这是最容易搞错的一点：
-15m 看的是"现在处在什么状态"，5m 看的是"刚刚有没有发生交叉"。
+---
+
+## 策略有没有效
+
+这是整个项目里唯一重要的问题，所以放在最前面。
+
+### 结论：无效。三个独立的证据。
+
+**证据一：扣掉成本之前就是亏的。**
+
+```bat
+set PYTHONPATH=src
+.venv\Scripts\python.exe tools\evaluate_edge.py
+```
+
+```
+source: data\platform.db   stop=3.0%   cost=8.0 bps/unit   params: EMA20/50 ADX>20.0 dev<=2%
+
+FULL SAMPLE (all stored history)
+  symbol           trades   win%     gross       net  breakeven  stop%    dd1x   dd10x  verdict
+  MU-USDT-SWAP         14    21%   -15.99%   -18.23%     -57.1b    50%   24.1%  100.0%  DIRECTION WRONG
+  ZEC-USDT-SWAP        10     0%   -29.69%   -31.29%    -148.5b    90%   32.2%  100.0%  DIRECTION WRONG
+  BTC-USDT-SWAP         3    33%    -3.40%    -3.88%     -56.7b    33%    5.0%   47.1%  DIRECTION WRONG
+  SPCX-USDT-SWAP        1   100%    +8.52%    +8.36%     425.8b     0%    1.6%   14.9%  noise (1 trade)
+  ----------------------------------------------------------------------------------------------------
+  TOTAL                28                    -45.06%
+
+  2 of 2 symbols with >=5 trades are negative before ANY cost.
+```
+
+`gross` 是**手续费和滑点之前**的收益。它是负的，意味着降低费率救不了这个策略——
+只有改逻辑能。而 `dd10x = 100%` 是账户口径：按 `equity_pct:100 × leverage:10` 算，
+**当前参数下会爆仓**。
+
+> 上面是脚本输出。数字随 K 线增长会小幅变动（BTC 从 −3.40% 走到 −3.14%），
+> 但**符号不会因为多几根 K 线就翻转**——这不是"再多等等就好了"的情况。
+
+**证据二：把信号反过来是赚的。**
+
+| | MU-USDT-SWAP | ZEC-USDT-SWAP |
+|---|---|---|
+| 原信号（15m 定方向） | −16% | −30% |
+| **完全反向**（多↔空） | **+19%** | **+51%** |
+
+这不是"发现了反指策略"，而是**说明当前样本里价格是往下走的，而策略在做多**。
+一个在下跌窗口里亏钱、在上涨窗口里赚钱的策略，就是个反向的择时器。
+
+> ⚠️ **不要把"反向"当成修复方案。** 上表只说明这 23 天的样本是下行窗口，
+> 换个窗口反向照样亏。它证明的是"参数不是解药"，不是"反着做能赚"。
+
+**证据三：找不出参数能救它，而找到了也说明不了什么。**
+
+扫 24 组参数（EMA 4 组 × ADX 3 档 × 偏离度 2 档）：
+
+| 参数 | 合计净收益 | 问题 |
+|---|---|---|
+| EMA20/50, ADX>20（当前） | −49.57% | |
+| EMA9/21, ADX>20 | **+2.77%** | 7 笔交易 |
+| EMA50/200, ADX=0 | **+12.16%** | **5 笔交易** |
+| 其余 21 组 | 全为负 | |
+
+看起来 EMA50/200 最好。但**这 5 笔交易在样本内外的表现是**：前半段 +3.39% / +4.32%，
+后半段 **−8.99%** / +5.43%。样本内外不一致 = 参数是拟合出来的，不是市场里的。
+
+> **这就是过拟合的教科书形态**：24 组参数里 4 组为正，看起来像"找到了解法"，
+> 实际上正收益的那几组交易数只有 2–7 笔。**每多试一组参数，就多一次让噪声变绿的机会。**
+> 参数扫描次数越多，越容易找到"最优解"，而它对未来的预测力是零。
+
+### 那这套代码还有什么价值
+
+结论是关于**策略**的，不是关于**代码**的。这些部分和策略有效性完全无关，
+是独立可验证的工程资产：
+
+- **回测引擎无未来函数**：信号在 K 线 N 收盘决定、N+1 开盘成交，逐根盯市算回撤。
+  这套纪律是可以复用到任何策略上的（见 [回测方法论](#回测方法论)）。
+- **风控是完整的**：两条下单路径都有账户级熔断 + halt 持久化。
+- **工程结构**：测试 192 项、限速统一管理、合约面值换算、缺口自动补齐。
+
+**要让它有意义，需要先换 alpha 来源**（不是调参数）。可考虑的方向和它们的代价：
+
+| 方向 | 代价 | 现实评价 |
+|---|---|---|
+| 拉长样本到 300+ 笔 | 需要 288 天历史（当前 0.5 笔/天/币） | 必做，但只是前置条件 |
+| 换成均值回归 | 逻辑重写 | 与当前趋势逻辑相反，可先在纸面上验证 |
+| 多币种横截面动量 | 需要更多币种数据 | 样本量天然更大，统计上更可行 |
+| 加过滤条件（成交量/波动率） | 中等 | ⚠️ 这就是在 24 组参数上再加一组 |
+
+**明确不建议**：继续调 `ema_fast`/`adx_min`/`deviation_max` 直到曲线变绿。
+
+### 最短的证伪路径
+
+```bat
+set PYTHONPATH=src
+.venv\Scripts\python.exe tools\evaluate_edge.py --split    rem 样本内外对照
+.venv\Scripts\python.exe tools\evaluate_edge.py --stop-pct 999   rem 无止损对照
+```
+
+如果哪天 `--split` 的两半都为正、`breakeven` 稳定高于 16 bps（真实成本的 2 倍），
+且交易数过百——那时候再谈上模拟盘。
+
+---
+
+## 策略逻辑
+
+**15m 提供方向（状态），5m 提供时机（事件）。** 这是最容易搞错的一点。
 
 四个条件必须同时成立：
 
 | # | 周期 | 条件 | 不成立时的原因码 |
 |---|---|---|---|
-| 1 | 15m | ADX **严格大于** `adx_min`（默认 20，不是 25） | `adx_too_low` |
-| 2 | 15m | EMA20 与 EMA50 分出方向（相等则无环境） | `no_trend_env` |
-| 3 | 15m | `abs(close - EMA20) / EMA20 <= 0.02`（偏离度） | `deviation_too_large` |
+| 1 | 15m | ADX **严格大于** `adx_min`（默认 20） | `adx_too_low` |
+| 2 | 15m | EMA20 与 EMA50 分出方向 | `no_trend_env` |
+| 3 | 15m | `abs(close - EMA20) / EMA20 <= 0.02` | `deviation_too_large` |
 | 4 | 5m | **刚刚发生**金叉 / 死叉 | `no_cross_event` |
 
-第 4 条是事件不是状态。判定方式是拿上一根和这一根比：
+第 4 条是事件不是状态：
 
 ```python
-# 多头：上一根 fast <= slow，这一根 fast > slow  → 金叉那一瞬间
+# 多头入场：上一根 fast <= slow，这一根 fast > slow
 prev_fast <= prev_slow and fast > slow
 ```
 
-也就是说，5m 图上 EMA20 一直在 EMA50 上方，是**没有**信号的 —— 只有它从下方穿上去的那
-一根才触发。一直持有多头状态不会每根 K 线重复发信号。
+EMA20 一直压在 EMA50 上方**没有**信号——只有从下方穿上去那一根才触发。
+否则趋势中的每根 K 线都会重复发单。
 
-偏离度过滤只作用于 15m、只在**新开仓**时生效，不影响已经持有的仓位（否则价格走远一点
-就会被误当成出场信号）。
+判定逻辑只有一份，在 `src/okx_ema_trader/strategy.py` 的 `classify()`。
+回测和实盘调用同一个函数，测试用对象身份断言钉住——**两份策略代码意味着
+回测测的是一个实盘从不交易的东西**。
 
-参数都在 `config/config.yaml`：`adx_min: 20`、`deviation_max: 0.02`、
-`ema_fast: 20`、`ema_slow: 50`、`adx_period: 14`。判定逻辑只有一份，在
-`strategy.py` 的 `classify()`；回测和实盘调用的是同一个函数（测试里用对象身份断言钉住）。
+参数在 `config/config.yaml`。偏离度只作用于 15m、只在**新开仓**时生效，
+不影响已持仓位（否则价格走远一点就会被误判成出场信号）。
 
-## 第二阶段之前：先测有没有 edge（`backtest.py`）
+---
 
-接任何下单逻辑之前，必须先回答一个问题：**这套 EMA 交叉到底能不能赚回手续费和滑点。**
+## 风控
 
-```bat
-cd /d F:\Claude\okx-ema-trader
-.venv\Scripts\activate
-set PYTHONPATH=src
-python -m okx_ema_trader.backtest --days 90
-```
+**两条下单路径都有账户级熔断。**
 
-可选参数：`--fee-bps`（单侧手续费，默认 5.0）、`--slippage-bps`（默认 3.0）、`--days`、`--symbol`、
-`--show-trades`（明细列出多少笔，默认 20，0 = 全部）。
-把两个 cost 都设成 0 可以看"毛利"，用来判断它是"被成本吃掉了"还是"根本没 alpha"。
-
-**成交模型：信号在 K 线 N 收盘时产生，在 K 线 N+1 的开盘价成交。**
-K 线 N 的收盘价不作为成交价使用——那是你看到信号之后才知道的价格，不可能成交在它上面。
-如果 K 线 N+1 不存在（信号出现在最后一根），这笔信号直接丢弃、不记账（输出里的 `unfilled signals`）。
-
-明细表把"决策时间"和"成交时间"分开列：
-`entry_signal_time` / `entry_execution_time` / `entry_price`、
-`exit_signal_time` / `exit_execution_time` / `exit_price` / `exit_reason`。
-止损成交两者相同（止损在被触及的那根 K 线上判定），信号/强平则相差一根。
-
-输出里最重要的一行是 **`BREAKEVEN cost`**：
-超过这个 bps 策略就归零。如果它低于 5，说明这策略连交易所手续费都覆盖不了。
-
-**回撤有两个数字，不要混用：**
-
-- `max drawdown (1x)` —— 名义本金口径。把策略当成"1 单位资金做 1 单位仓位"，
-  描述的是**信号本身的波动**。
-- `max drawdown`（账户口径）—— 按 `config.yaml` 里的 `equity_pct × leverage` 换算到账户，
-  超过 100% 会封顶，并单独给出 `account wiped out` 和 `ruin leverage`。
-  `ruin leverage` = 满仓时超过多少倍杠杆这轮就会归零。
-
-这两个数字差很多。`equity` 序列记录的是**累计盈亏除以名义本金**，起点是 0，
-它的峰值是"赚了多少"，不是"本金有多少"。拿盈亏波动除以盈亏峰值会算出荒谬的数字
-（曾经输出过 284%），所以换算时必须显式带上账户敞口。
-
-`equity` 是**逐根 K 线盯市**的：持仓期间的浮亏也在序列里。这一点不是细节 ——
-只在成交那一刻采样（曾经的行为）会把 8638 根 K 线压成 16 个点，于是最深的那段
-浮亏、也就是真正决定会不会被强平的那段，根本不出现在序列里。实测偏差：AAVE
-30 天 `ruin leverage` 报 30.86x，逐 bar 盯市的真值是 23.38x；回撤 64.86% vs
-82.58%。**漏掉浮亏会往"更安全"的方向错**，而这正是选杠杆时最不能错的那个数字。
-
-只读公共行情，不需要 API Key。`--proxy` 默认取 Windows 系统代理（Internet 选项里那个）；
-传 `--proxy ""` 走直连。
-
-## 合约规格（`instruments.py`）
-
-**一张合约不等于一个币**，而且每个合约都不一样：
-
-| 合约 | ctVal | 1 张 = | 最大杠杆 |
+| 路径 | 会真下单吗 | 熔断 | 阈值位置 |
 |---|---|---|---|
-| BTC-USDT-SWAP | 0.01 | 0.01 BTC | 100x |
-| AAVE-USDT-SWAP | 0.1 | 0.1 AAVE | 50x |
-| MU-USDT-SWAP | 1 | 1 MU（股票代币） | 50x |
+| `executor.py` | **是**，OKX demo 盘 | `risk_guard.Guard` | `config.yaml` 的 `risk:` 段 |
+| `platform/` | 否，paper account | `health.enforce_risk` | `main.py` 的 `RISK_LIMITS` |
 
-`contracts × price` 在 BTC 上会把仓位放大 100 倍。所有"张数 ↔ 金额"的换算都走 `instruments.py`，
-它同时管 `lotSz`（数量步长，不是 `minSz`）、`minSz`、`tickSz`、`maxMktSz` 和杠杆上限。
-下单前 `Broker` 会读一次规格并缓存；读不到时回退到 ccxt 的市场缓存。
-
-来自 OKX 官方 agent-skills（`okx-cex-trade` / `okx-cex-market`）的要点已经核对过：
-其中"股票代币最大 5x"和"只在美股时段交易"两条，与本机实测不符 ——
-MU-USDT-SWAP 的 `lever` 字段是 50，且 5 天 1439 根 5m K 线里只有 1 根没有成交。
-**以交易所返回值为准。**
-
-## 限速（`http.py`）
-
-OKX 公共行情是 **20 请求 / 2 秒 / IP**。所有 REST 调用共用 `http.py` 里的一个滑动窗口节流器 ——
-回测分页和控制台各睡各的礼貌间隔，加起来照样会超限，所以预算必须由一处统一持有。
-
-`http.py` 同时区分三类失败：连不上（network）、HTTP 状态码（http，如 404 币种不存在）、
-业务 code（api，如 51001）。以前三者一律报"连不上 OKX，检查代理"，
-把币种写错误导成代理坏了。
-
-## 回归测试
-
-```bat
-set PYTHONPATH=src
-.venv\Scripts\python.exe tests\test_indicators.py
-.venv\Scripts\python.exe tests\test_strategy.py
-.venv\Scripts\python.exe tests\test_executor.py
-.venv\Scripts\python.exe tests\test_symbols.py
-.venv\Scripts\python.exe tests\test_instruments.py
-.venv\Scripts\python.exe tests\test_platform_market.py
-.venv\Scripts\python.exe tests\test_platform_paper.py
-.venv\Scripts\python.exe tests\test_platform_autotrader.py
-.venv\Scripts\python.exe tests\test_platform_autotrader_multi.py
-.venv\Scripts\python.exe tests\test_platform_health.py
-.venv\Scripts\python.exe tests\test_platform_search.py
-.venv\Scripts\python.exe tests\test_http_headers.py
-.venv\Scripts\python.exe tests\test_platform_prune.py
-.venv\Scripts\python.exe tests\test_platform_poller.py
-```
-
-- `test_indicators.py`：冻结了一份重构前的指标实现作为参照基准。
-  改动 `indicators.py` 后必须重跑，确保 live 的实盘路径没有被误改。
-- `test_strategy.py`：信号是 EVENT 不是 STATE；下一根开盘成交；止损保守判定；不许偷看未来。
-- `test_executor.py`：对账失败拒绝交易、demo 凭据门禁、config 兼容性与非法值拒绝。
-- `test_symbols.py`：币种归一——`MU`/`MUUSDT`/`mu-usdt-swap` 归一到同一个 instId、
-  非 USDT 永续一律拒绝、**`SymbolError` 必须是 `ValueError` 子类**（否则交易路径的
-  `(ValueError, KeyError)` 兜不住，一个坏币种会拖垮整轮扫描而不是被跳过）。
-- `test_instruments.py`：ctVal 换算、`lotSz` 与 `minSz` 的区别、浮点不漂移、
-  杠杆上限、`maxMktSz`、ccxt 符号映射、**回撤的单位**、限速器记账。
-- `test_platform_market.py`：平台行情层——confirm 标志位索引、成形K线的更正而非重复、
-  前向/后向缺口补拉、防死循环守卫、poller 容错。
-- `test_platform_paper.py`：模拟账户——双边手续费、保证金检查、强平价、
-  权益连续性（平仓瞬间跳变=平仓费）、重复平仓拒绝。
-- `test_platform_autotrader.py`：自动交易——与回测同源的信号评估、每根K线只评估一次、
-  反向先平后开、价格获取失败记录而不穿透。
-- `test_platform_autotrader_multi.py`：自选列表扫描——**去重键带币种**（否则一个币的
-  bar 时间戳会吞掉其他币）、持仓上限（平仓永远放行，开仓才要看额度）、单币异常
-  不拖垮整轮扫描、legacy 单币种设置迁移。
-- `test_platform_health.py`：熔断与连通性——账户级回撤停机、连亏计数、强平价、
-  以及 health 徽标**在自动交易关闭时不得伪装成"连接正常"**。
-- `test_platform_search.py`：币种搜索——只留 USDT 永续、按**成交额**（量×价）排序防低价币霸榜、
-  5 分钟缓存、离线降级为本地币种清单。
-- `test_platform_prune.py`：数据保留——45 天K线窗口、**持仓永不删**、
-  日志表截断 keep-N、prune 幂等、VACUUM 后数据完整。
-- `test_platform_poller.py`：智能轮询——K线只在 bar 边界拉取、未确认重试、
-  ticker 内存热缓存 60s 节流落盘、stop() 冲刷缓存。
-- `test_http_headers.py`：请求头形状——**UA 必须像真实 Chrome**。
-  原来的 `Mozilla/5.0 (compatible; okx-ema-trader)` 会被 OKX 的 Cloudflare
-  以 `error code: 1010`（浏览器指纹拦截）挡回 403，而浏览器和 curl 访问同一
-  URL 一切正常。改 UA 时先跑这个测试，别再写回机器人自报家门的形式。
-
-全部离线，不联网、不需要 API Key。
-
-## 交易平台（`platform/`：Vue 3 前端 + FastAPI 后端 + SQLite 持久化）
-
-交易所式三栏界面（行情/图表/订单回测），数据本地永久储存，OKX 只补缺口。
-
-```bat
-start-platform.bat          rem 启动 http://127.0.0.1:8788
-```
-
-- **本地优先**：K线先读 `data/platform.db`，缺口才回源 OKX（后向 `after` 翻页补历史、
-  前向 `before` 翻页补停机空洞），20 req/2s 的限速预算由 `http.py` 统一掌管。
-- **成形K线**（confirm=0）也入库供图表显示，但回测/信号只读 `only_confirmed=True`。
-- **后台 poller**：每 5s 刷新最新K线+ticker，浏览器端只读本地库，不直接打 OKX。
-- 前端改动后需 `cd platform/frontend && npm run build`（或开发模式 `npm run dev`，
-  vite 代理 /api 到 8788）。API 文档在 `/docs`。
-
-### 币种清单与归一
-
-搜索结果只保留 **USDT 永续**，按成交额排序。两个 OKX 的 API 现实决定了这里的实现
-（原先写在旧控制台里，现在归 `platform/backend`）：
-
-- `/public/instruments` 最多返回 500 条，而永续合约不止 500 个 —— MU 就不在列表里。
-  所以已配置的币种会单独补查再合并进来。
-- SWAP 的 `/market/tickers` 只给 `vol24h`（张数）和 `volCcy24h`（基础币数量），
-  **没有 USDT 成交额字段**。成交额是 `volCcy24h × last` 自己算的。直接拿
-  `volCcy24h` 排名会把 SATS / PEPE 这种单价极小的币排到 BTC 前面。
-
-币种归一在 `src/okx_ema_trader/symbols.py`：`MU` / `MUUSDT` / `mu-usdt-swap`
-都归一成 `MU-USDT-SWAP`。**只接受 USDT 本位永续，认不出来就报错而不是猜** ——
-猜错等于在另一个市场开了仓。
-
-## K 线导出与画图（`fetch_mu_candles.py`）
-
-按标的 / 周期 / 日期导出 OKX 永续 K 线，存 CSV 并画 K 线图（红涨绿跌，带成交量）。
-
-```bat
-.venv\Scripts\python.exe fetch_mu_candles.py                     :: 昨天 MU-USDT-SWAP 5m
-.venv\Scripts\python.exe fetch_mu_candles.py --date 2026-10-02   :: 指定日期
-.venv\Scripts\python.exe fetch_mu_candles.py --inst BTC-USDT-SWAP --bar 15m
-.venv\Scripts\python.exe fetch_mu_candles.py --proxy http://127.0.0.1:7890
-```
-
-也可以直接跑上面的命令。产物写到 `data/`：一份 `CSV` + 一张 `PNG`，画完自动打开。
-
-- 用 `/api/v5/market/history-candles` 的 `after` 游标翻页凑齐一整天（5m 一天 288 根，需翻 3 页）。
-- 日期默认「昨天」，时区默认 `Asia/Shanghai`，用 `--date` / `--tz` 改。
-- **代理自动探测**：`--proxy` > 环境变量 > `.mcp.json` > 常见本地端口 > 直连；都失败就显式 `--proxy` 指定。
-
-## 可选依赖（画图）
-
-只影响上一节的画图功能，没装的话脚本会自动降级成「只导 CSV」：
-
-```bat
-.venv\Scripts\python.exe -m pip install matplotlib mplfinance
-```
-
-## 已知限制
-
-已经有的：`Ledger` 持仓账本（`state.yaml`，首次真实持仓时生成）、每轮对账
-（`reconciled N symbol(s)`）、开仓时把止损写进同一请求、止损没挂上就自动平掉、
-demo 门禁、回测与实盘共用策略、限速、合约规格换算、账户级熔断。
-
-**两条下单路径都有账户级熔断了**（`9c35a24` 之前只有 `platform/` 有）。
-
-| 路径 | 会真的下单吗 | 账户级熔断 | 阈值写在哪 |
-|---|---|---|---|
-| `executor.py` | **是**，OKX demo 盘 | 有（`risk_guard.Guard`） | `config/config.yaml` 的 `risk:` 段 |
-| `platform/` 自动交易 | 否，paper account | 有（`health.enforce_risk`） | `platform/backend/main.py` 的 `RISK_LIMITS` |
-
-两条路径的阈值**故意不一样，不是漏改**：
+两边的阈值**故意不同**：
 
 | | 账户回撤上限 | 连亏停手 | 单仓上限 |
 |---|---|---|---|
-| `executor.py` | 60% | 3 笔 | 30% 账户权益（= 3% 止损 × 10x） |
-| `platform/` | 25% | 5 笔 | 60% 该仓位的保证金 |
+| `executor.py` | 60% | 3 笔 | 30% 权益（= 3% 止损 × 10x） |
+| `platform/` | 25% | 5 笔 | 60% 该仓保证金 |
 
-原因是敞口根本不同：`executor` 是 10x + 100% 权益，一次正常止损就亏掉 30%
-权益，25% 会在**第一次**止损时误触发；`platform` 自动交易默认 5x + 固定 100
-USDT 名义，一次止损约 3 USDT，跌到 25% 已经是事故。同一个数字塞进两套敞口，
-必然有一边是在噪声上刹车。（另外 `platform` 的单仓上限按"该仓位的保证金"计，
-`executor` 按"账户权益"计——分母不同，别照抄。）
+敞口不同：executor 是 10x + 100% 权益，一次止损就亏 30% 权益，25% 会在**第一次**
+止损时误触发；platform 是默认 5x + 固定 100 USDT，一次止损约 3 USDT。
+**同一个数字塞进两套敞口，必然有一边在噪声上刹车。**
 
-熔断触发后是 **halt（停手）**，不是只平仓：只平仓会让机器人立刻按同一套逻辑
-再开一笔，反复摩擦手续费。halt 会持久化，重启不解除，需要人工 `--reset-halt`
-或 `/api/risk/reset`。
+触发后是 **halt（停手）**而非只平仓：只平仓会让机器人立刻按同一逻辑再开一笔，
+反复摩擦手续费。halt 持久化，重启不解除，需人工 `--reset-halt` / `/api/risk/reset`。
 
-其他还没有的：
+阈值不合理的配置在启动时就被拒绝（`>100%` 的回撤阈值永远触发不了 = 静默失效）。
 
-- **按时间冷却**。`executor` 仍然是无状态的：每轮看指标 + 看账本决定动作。连亏
-  计数已经有了（存在 `state.yaml` 的 `risk` 段，重启不丢），但"亏完休息 N 根
-  K 线再回来"这种跨周期的时间冷却还没有。
-- **行情缓存落盘**（仅 `executor`）。`platform/` 已经把 K 线存进
-  `data/platform.db`、只补缺口，并且断线重连后会自动补回中间那段空洞
-  （`Store.candle_gaps()` + 轮询器的 heal）；`executor` 每次启动仍重新拉全量
-  历史，断线重连靠重新预热。
-- **成本模型校准**。默认的 5 bps 手续费 + 3 bps 滑点是估算值，没有用真实成交回填验证过。
+---
 
-下一步的建议顺序：给后端路由补测试（`tests/test_platform_routes.py` 是开头，
-22 个路由目前覆盖极少），再考虑把 `main.py` 按域拆成多个 router 模块。
+## 交易平台
 
-`logs/` 是运行产物（已被 `.gitignore` 忽略），程序跑起来会自动写入。
-历史清理掉的东西（含 `smoke_order.py` DEMO 下单冒烟测试）在
-`.cleanup-backup/<时间戳>/` 有完整备份，需要可原样取回。
+`platform/`：Vue 3 前端 + FastAPI 后端 + SQLite 持久化，交易所式三栏界面。
+
+```bat
+start-platform.bat          rem http://127.0.0.1:8788
+```
+
+- **本地优先**：K 线先读 `data/platform.db`，缺口才回源 OKX。
+  断线重连后自动补回中间那段空洞（`Store.candle_gaps()` + 轮询器 heal），
+  不需要手动刷页面。
+- **成形 K 线**（confirm=0）入库供显示，但回测/信号只读 `confirm=1`。
+- **后台 poller**：每 5s 刷新，浏览器只读本地库。ticker 按币种去重、
+  订阅列表 LRU 上限 40（自动交易的币种 `pin=True` 豁免）。
+- **模拟盘**用真实 bid/ask 和双边手续费，非假装成交。
+- 前端改动后 `cd platform/frontend && npm run build`。API 文档在 `/docs`。
+
+### 两个 OKX 的 API 现实
+
+- `/public/instruments` 最多返回 500 条，永续合约不止 500 个（MU 就不在列表里），
+  所以已配置的币种单独补查再合并。
+- SWAP 的 `/market/tickers` **没有 USDT 成交额字段**，成交额是
+  `volCcy24h × last` 自己算的。直接按 `volCcy24h` 排名会把 PEPE 排到 BTC 前面。
+
+### 合约规格
+
+**一张合约不等于一个币**，每个合约都不一样：
+
+| 合约 | ctVal | 1 张 = |
+|---|---|---|
+| BTC-USDT-SWAP | 0.01 | 0.01 BTC |
+| AAVE-USDT-SWAP | 0.1 | 0.1 AAVE |
+| MU-USDT-SWAP | 1 | 1 MU |
+
+`contracts × price` 在 BTC 上会把仓位放大 100 倍。所有换算走 `instruments.py`。
+
+---
+
+## 回测方法论
+
+这部分是项目里最值得复用的东西。**它和策略有没有效无关。**
+
+**信号在 K 线 N 收盘产生，在 K 线 N+1 的开盘成交。** K 线 N 的收盘价不作为成交价——
+那是你看到信号之后才知道的价格，不可能成交在它上面。明细表把 `entry_signal_time`
+和 `entry_execution_time` 分开列。
+
+**逐根 K 线盯市。** 持仓期间的浮亏计入权益序列。只在成交时采样会把 8638 根 K 线
+压成 16 个点，最深那段浮亏（真正决定会不会被强平的）根本不出现在序列里。
+实测偏差：AAVE 30 天 `ruin leverage` 报 30.86x，逐根盯市的真值是 23.38x。
+**漏掉浮亏会往"更安全"的方向错**，而这正是选杠杆时最不能错的数字。
+
+**回撤有两个口径，不要混用。** `max drawdown (1x)` 是信号本身的波动；
+账户口径按 `equity_pct × leverage` 换算，超 100% 封顶。`equity` 序列是
+**累计盈亏**（起点 0），它的峰值是"赚了多少"不是"本金有多少"——
+拿盈亏波动除以盈亏峰值会算出荒谬的数字（曾输出过 284%）。
+
+**`BREAKEVEN bps` 是最诚实的数字**，因为它与样本量无关：它把全部毛利摊到
+总换手上，表示"每单位成本涨到多少就归零"。读法：
+
+- 强正 → 真有 edge，且明显高于成本
+- 小正 → edge 比成本薄
+- **负 → 毛利本身是负的，方向错了，降费用救不了**
+
+**`tools/evaluate_edge.py` 在此之上做了三件 `backtest.py` 不做的事**：
+多币种、样本内外拆分、把止损的贡献和信号本身的贡献分开。
+它读本地 `data/platform.db` 而不联网——所以断网时也能跑。
+
+---
+
+## 项目结构
+
+```
+src/okx_ema_trader/
+  strategy.py        唯一的信号判定（回测与实盘共用）
+  backtest.py        回测引擎：无未来函数 + 逐根盯市
+  executor.py        OKX demo 盘自动交易（会真下单的那条路径）
+  risk_guard.py      账户级熔断（executor 侧）
+  config.py          配置 + 启动时校验
+  http.py            限速器（20 req/2s）+ 三类错误分类
+  instruments.py     合约规格换算
+  storage.py         SQLite K 线存储
+  symbols.py         币种归一（认不出来就报错，不猜）
+platform/
+  backend/           FastAPI：路由 / 风控 / 行情 / 模拟盘
+  frontend/          Vue 3 交易界面
+tools/
+  evaluate_edge.py   多币种 + 样本内外 edge 评估
+tests/               192 项
+```
+
+---
+
+## 测试
+
+```bat
+set PYTHONPATH=src
+.venv\Scripts\python.exe -m pytest tests\ -q
+```
+
+192 项，全部离线，不联网、不需要 API Key。
+
+| 文件 | 钉住什么 |
+|---|---|
+| `test_strategy.py` | 信号是 EVENT 不是 STATE；下根开盘成交；止损保守判定；不许偷看未来 |
+| `test_executor.py` | 对账失败拒绝交易、demo 门禁、config 兼容性与非法值拒绝 |
+| `test_platform_health.py` | 熔断：账户回撤停手、连亏计数、强平价 |
+| `test_platform_market.py` | 缺口补拉、断线重连后自动补洞 |
+| `test_platform_poller.py` | bar 边界拉取、ticker 去重、订阅上限、unwatch 清状态 |
+| `test_symbols.py` | 币种归一；**`SymbolError` 必须是 `ValueError` 子类** |
+| `test_instruments.py` | ctVal 换算、`lotSz` vs `minSz`、浮点不漂移、杠杆上限 |
+| `test_http_headers.py` | **UA 必须像真实 Chrome** |
+| `test_platform_routes.py` | 错符号必须 400 不是 500 |
+
+### 测试纪律
+
+**"测试全绿"这个信号本身要先验证。** 一次变异：故意破坏一处逻辑，
+看有没有测试变红。变不了红的就是装饰品。
+
+这个项目踩过：41 个测试用例用 `return failures` 而没有 `assert`，
+pytest 只发 warning **不判失败**——它们覆盖了全部策略语义和风控逻辑，
+但从来不可能变红。修复后做了变异验证（把 `adx <= adx_min` 改成 `<`，
+正确地产生 2 个失败）。
+
+---
+
+## 已知限制
+
+- **策略没有正期望**。见 [策略有没有效](#策略有没有效)。这是当前最重要的一条。
+- **样本量不足**。28 笔交易，统计上无法判断任何东西。需要 300+ 笔 / 288 天。
+- **成本模型是估算值**。5 bps 手续费 + 3 bps 滑点，没有用真实成交回填验证。
+- **后端路由测试覆盖少**。22 个路由只覆盖了 4 个（`tests/test_platform_routes.py`
+  是开头）。`main.py` 有 700+ 行，应该按域拆成多个 router。
+- **executor 无行情缓存落盘**。platform 已有缺口自动补齐，executor 仍每次
+  启动重拉全量。
+- **没有按时间冷却**。连亏计数有了（持久化在 `state.yaml`），
+  但"亏完休息 N 根 K 线"这种跨周期冷却没有。
+
+## 安全边界
+
+`credentials.py` 拒绝非 demo profile，`Broker` 强制 sandbox 并校验
+`x-simulated-trading` 响应头。**代码里不存在连实盘的路径。**
+
+但请注意：**demo 盘是真钱味的训练场**。10x 满仓下一次止损就是 30% 权益，
+三连亏基本归零。当前策略在回测里就会爆仓（`dd10x = 100%`），
+所以上模拟盘之前先想清楚这笔钱是不是白交。
