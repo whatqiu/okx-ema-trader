@@ -82,10 +82,16 @@ RISK_LIMITS = health.RiskLimits(
     # before the 20% liq distance; a tighter cap would turn ordinary noise into
     # forced exits, which is how a strategy loses money on its own brake.
     max_loss_pct=60.0,
-    # 25% of the account. A day that erases a quarter of the balance means
-    # something is structurally wrong, not that the market is hard.
-    max_daily_loss_pct=25.0,
-    # Five losses in a row: stop letting the strategy open new risk.
+    # 25% of the account, measured from the equity the brake was installed at
+    # (see `health.risk_baseline`) — NOT "per day", despite what this used to be
+    # called. Deliberately not the 60% in config.yaml's `risk:` section: that
+    # one governs `executor.py`, which runs 10x on 100% of equity where a single
+    # 3% stop costs 30% of the account. Auto-trade here runs 5x on a fixed 100
+    # USDT, where one stop costs about 3 USDT. Importing 60 here would move the
+    # brake from "something is wrong" to "most of the account is gone".
+    max_drawdown_pct=25.0,
+    # Five losses in a row: stop letting the strategy open new risk. Higher than
+    # executor's three for the same reason — the losses here are 1/30th the size.
     max_consecutive_losses=5,
     # Exit when the mark is within 3% of the liq price. At 5x that is well
     # outside the 20% liq distance, so this is a brake, not a coin flip.
@@ -218,8 +224,8 @@ async def lifespan(app: FastAPI):
     # that stop moving.
     _boot_cfg = deps.config()
     for _inst in autotrader.get_state(deps.store())["symbols"]:
-        _poller.watch(_inst, _boot_cfg.bar_5m)
-        _poller.watch(_inst, _boot_cfg.bar_15m)
+        _watch(_inst, _boot_cfg.bar_5m, pin=True)
+        _watch(_inst, _boot_cfg.bar_15m, pin=True)
     _auto_stop.clear()
     _janitor_stop.clear()
     auto_thread = threading.Thread(target=_auto_loop, daemon=True,
@@ -290,9 +296,15 @@ def _okx(call, label: str = ""):
         raise HTTPException(400, str(exc)) from exc
 
 
-def _watch(symbol: str, bar: str) -> None:
+def _watch(symbol: str, bar: str, *, pin: bool = False) -> None:
+    """Subscribe, and mark `pin` for symbols a loop depends on.
+
+    The poller evicts least-recently-used entries (see `MarketPoller.MAX_WATCH`),
+    which is safe for a chart — the next request re-subscribes it — but not for
+    auto-trade, whose scan would carry on against candles nobody is refreshing.
+    """
     if _poller is not None:
-        _poller.watch(symbol, bar)
+        _poller.watch(symbol, bar, pin=pin)
 
 
 # --------------------------------------------------------------------------
@@ -476,8 +488,8 @@ def autotrade_set(patch: AutoTradePatch):
                  label=f"candles {inst} 5m")
             _okx(lambda i=inst: market.ensure_candles(store, i, cfg.bar_15m, 200),
                  label=f"candles {inst} 15m")
-            _watch(inst, cfg.bar_5m)
-            _watch(inst, cfg.bar_15m)
+            _watch(inst, cfg.bar_5m, pin=True)
+            _watch(inst, cfg.bar_15m, pin=True)
         autotrader.maybe_trade_all(store)
         state = autotrader.get_state(store)
     return _json_safe(state)
@@ -560,7 +572,7 @@ def health_status():
             "limits": {
                 "enabled": RISK_LIMITS.enabled,
                 "max_loss_pct": RISK_LIMITS.max_loss_pct,
-                "max_daily_loss_pct": RISK_LIMITS.max_daily_loss_pct,
+                "max_drawdown_pct": RISK_LIMITS.max_drawdown_pct,
                 "max_consecutive_losses": RISK_LIMITS.max_consecutive_losses,
                 "liq_buffer_pct": RISK_LIMITS.liq_buffer_pct,
             },
@@ -768,7 +780,10 @@ def run_backtest(req: BacktestRequest):
 
 @app.get("/api/backtests")
 def backtests(symbol: str | None = None, limit: int = Query(30, ge=1, le=200)):
-    inst = deps.normalise_symbol(symbol) if symbol else None
+    # `_symbol`, not `normalise_symbol`: a typo'd query string must be a 400,
+    # not a 500 with a traceback. The POST above normalises `req.symbol` the
+    # same way, so both halves of this endpoint answer identically.
+    inst = _symbol(symbol) if symbol else None
     rows = deps.store().backtests(limit=limit, inst_id=inst)
     # The list view does not need full trade lists — keep the payload small.
     for row in rows:

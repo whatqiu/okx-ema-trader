@@ -184,11 +184,18 @@ class RiskLimits:
 
     enabled: bool = True
     max_loss_pct: float = 60.0      # of position margin
-    max_daily_loss_pct: float = 0.0  # of account equity; 0 disables
+    max_drawdown_pct: float = 0.0   # of account equity; 0 disables
     max_consecutive_losses: int = 0  # 0 disables
     # Close when the mark is within this many PERCENT of the liquidation price.
     # 5x puts liq 20% away, so 3.0 means "exit once a third of the way there".
     liq_buffer_pct: float = 3.0
+
+    # Why this cap is NOT executor.py's 60%: the two are not the same bet.
+    # Here auto-trade runs 5x on a FIXED 100 USDT notional, so one 3% stop costs
+    # about 3 USDT and even a long bad run stays small; 25% of the account is a
+    # real emergency. `executor.py` runs 10x on 100% of equity, where one stop
+    # is 30% of the account and 25% would trip on the first loss. Same number in
+    # both places would make one of them fire on noise. See `risk_guard.py`.
 
 
 @dataclass
@@ -336,7 +343,10 @@ def evaluate_risk(positions: list[dict], *, equity: float, baseline: float,
 
     `baseline` is the drawdown reference — see `risk_baseline`. It is NOT the
     account's opening balance, and calling it `initial` was exactly the kind of
-    name that made `max_daily_loss_pct` mean something nobody intended.
+    name that made this threshold mean something nobody intended: it used to be
+    called `max_daily_loss_pct`, but nothing here resets by day, by restart, or
+    by anything else. It is `max_drawdown_pct` now, measured from the moment the
+    brake was installed.
     """
     if not limits.enabled:
         return RiskDecision()
@@ -379,9 +389,9 @@ def evaluate_risk(positions: list[dict], *, equity: float, baseline: float,
     #    what we want: the brake should react to open positions bleeding, not
     #    only to closed ones.
     account_level = ""
-    if limits.max_daily_loss_pct > 0 and baseline > 0:
+    if limits.max_drawdown_pct > 0 and baseline > 0:
         drawdown = (baseline - equity) / baseline * 100.0
-        if drawdown >= limits.max_daily_loss_pct:
+        if drawdown >= limits.max_drawdown_pct:
             account_level = "account-drawdown"
 
     if account_level:
@@ -392,7 +402,7 @@ def evaluate_risk(positions: list[dict], *, equity: float, baseline: float,
             should_close=True, reason=account_level, halt=True,
             detail={"drawdown_pct": round(
                         (baseline - equity) / baseline * 100.0, 2),
-                    "limit_pct": limits.max_daily_loss_pct,
+                    "limit_pct": limits.max_drawdown_pct,
                     "condemned": sorted(condemned) or "ALL"},
         )
     if condemned:

@@ -283,12 +283,19 @@ class MarketPoller:
     """
 
     TICKER_PERSIST_S = 60.0
+    # Hard cap on the watch list. `/api/candles` calls `watch()` on every
+    # request, so browsing the instrument list grows this without bound, and
+    # every entry costs a ticker request per pass against a 20-req/2s budget.
+    # Oldest non-pinned entries are dropped.
+    MAX_WATCH = 40
 
     def __init__(self, store, interval: float = 5.0, fetch=None) -> None:
         self._store = store
         self._interval = interval
         self._fetch = fetch  # test hook; None -> deps.okx_get
-        self._watch: list[tuple[str, str]] = []
+        self._watch: list[tuple[str, str]] = []  # oldest first, newest last
+        # Entries that must never be evicted; see `watch(pin=True)`.
+        self._pinned: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -303,15 +310,50 @@ class MarketPoller:
         # first pass that succeeds again.
         self._to_heal: set[tuple[str, str]] = set()
 
-    def watch(self, inst_id: str, bar: str) -> None:
+    def watch(self, inst_id: str, bar: str, *, pin: bool = False) -> None:
+        """Start polling `inst_id`/`bar`, or move it to the front if it is
+        already watched.
+
+        `pin` makes the entry unevictable. Auto-trade pins its symbols, because
+        a scan that quietly stopped refreshing one of them is far worse than
+        paying for an extra request; everything else is LRU and can fall off the
+        end of the list.
+
+        The LRU works only because `/api/candles` re-watches on every request:
+        a chart you have open gets pushed back to the front every few seconds,
+        so the entries that reach the end really are the ones nobody is looking
+        at.
+        """
         key = (inst_id, bar)
         with self._lock:
-            if key not in self._watch:
-                self._watch.append(key)
+            if pin:
+                self._pinned.add(key)
+            if key in self._watch:
+                self._watch.remove(key)
+            self._watch.append(key)
+            self._evict()
 
     def unwatch(self, inst_id: str, bar: str) -> None:
+        key = (inst_id, bar)
         with self._lock:
-            self._watch = [k for k in self._watch if k != (inst_id, bar)]
+            self._watch = [k for k in self._watch if k != key]
+            self._pinned.discard(key)
+            # Without these two the per-bar cursor and any pending gap-heal
+            # outlive the entry they belong to and leak for the life of the
+            # process — and a stale `confirmed` cursor would make a re-watched
+            # symbol skip its first bar.
+            self._candle_state.pop(key, None)
+            self._to_heal.discard(key)
+
+    def _evict(self) -> None:
+        """Drop the oldest non-pinned entries over MAX_WATCH. Caller holds lock."""
+        while len(self._watch) > self.MAX_WATCH:
+            victim = next((k for k in self._watch if k not in self._pinned), None)
+            if victim is None:
+                return  # everything left is pinned: over budget, but correct
+            self._watch.remove(victim)
+            self._candle_state.pop(victim, None)
+            self._to_heal.discard(victim)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -386,10 +428,16 @@ class MarketPoller:
         """One pass over the watch list. Exposed for tests."""
         with self._lock:
             targets = list(self._watch)
+        # One ticker per SYMBOL per pass, not one per (symbol, bar): a symbol
+        # watched on both 5m and 15m is still one instrument, so the old loop
+        # spent two of the 20-req/2s budget to learn one price.
+        tickers_done: set[str] = set()
         for inst_id, bar in targets:
             try:
                 self._poll_candles(inst_id, bar)
-                self._poll_ticker(inst_id)
+                if inst_id not in tickers_done:
+                    tickers_done.add(inst_id)
+                    self._poll_ticker(inst_id)
                 self.last_error = None
                 if (inst_id, bar) in self._to_heal:
                     # We just came back from a failure. The bars that closed

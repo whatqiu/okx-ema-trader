@@ -5,6 +5,9 @@ Pinned invariants:
   - same bar bucket + confirmed bar -> NO candle re-fetch (rate-budget saver)
   - unconfirmed close -> keeps retrying on the next passes
   - ticker fetched every pass but PERSISTED at most once per 60s
+  - one ticker per SYMBOL per pass, even when both bars are watched
+  - the watch list is bounded, and pinned (auto-trade) symbols are never evicted
+  - unwatch() also drops the per-bar cursor, so re-watching really re-fetches
   - latest_ticker prefers memory, falls back to DB
   - stop() flushes the hot ticker cache to disk
 """
@@ -176,6 +179,75 @@ def test_latest_ticker_db_fallback_and_stop_flush():
             check("stop() flushes hot cache", spy.saved_ticks == before + 1)
             check("flushed tick readable from db",
                   store.tick(INST)["last"] == 101.0)
+        finally:
+            store.close()
+
+
+def test_ticker_fetched_once_per_symbol_not_per_bar():
+    """A symbol watched on 5m AND 15m is still one instrument.
+
+    Before the de-dup this cost two ticker requests per pass to learn one price,
+    which is exactly the budget that runs out first when the watch list grows.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(Path(tmp) / "t.db")
+        try:
+            calls = []
+            poller = market.MarketPoller(
+                store, fetch=make_fetch(calls, candle_confirm=True))
+            poller.watch(INST, "5m")
+            poller.watch(INST, "15m")
+            poller.poll_once()
+            check("two bars -> one ticker request",
+                  calls.count("/market/ticker") == 1)
+            check("two bars -> two candle requests",
+                  calls.count("/market/candles") == 2)
+        finally:
+            store.close()
+
+
+def test_watch_list_is_bounded_and_pinned_entries_survive():
+    """Browsing symbols must not grow the poll loop without bound, but a pinned
+    symbol (auto-trade's) must never be the one dropped."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(Path(tmp) / "t.db")
+        try:
+            poller = market.MarketPoller(store, fetch=lambda p, q: [])
+            pinned = [("PIN-A-USDT-SWAP", "5m"), ("PIN-B-USDT-SWAP", "5m")]
+            for inst, bar in pinned:
+                poller.watch(inst, bar, pin=True)
+            for i in range(market.MarketPoller.MAX_WATCH + 5):
+                poller.watch(f"S{i}-USDT-SWAP", "5m")
+            check("watch list capped at MAX_WATCH",
+                  len(poller._watch) == market.MarketPoller.MAX_WATCH)
+            check("pinned symbols survive eviction",
+                  all(k in poller._watch for k in pinned))
+            check("evicted entries leave no bar-state behind",
+                  all(k in poller._watch for k in poller._candle_state))
+        finally:
+            store.close()
+
+
+def test_unwatch_clears_the_bar_state():
+    """A stale `confirmed` cursor surviving an unwatch would make the symbol
+    skip its first bar when it is watched again."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(Path(tmp) / "t.db")
+        try:
+            calls = []
+            poller = market.MarketPoller(
+                store, fetch=make_fetch(calls, candle_confirm=True))
+            poller.watch(INST, BAR)
+            poller.poll_once()
+            check("bar state recorded", (INST, BAR) in poller._candle_state)
+            poller.unwatch(INST, BAR)
+            check("unwatch drops the entry", (INST, BAR) not in poller._watch)
+            check("unwatch drops the bar state",
+                  (INST, BAR) not in poller._candle_state)
+            poller.watch(INST, BAR)
+            poller.poll_once()
+            check("re-watched symbol fetches again",
+                  calls.count("/market/candles") == 2)
         finally:
             store.close()
 

@@ -19,10 +19,15 @@
 停手而不是只平仓：只平仓不停手会让机器人平完立刻按同一套逻辑再开一笔，反
 复摩擦手续费（platform 那边已经踩过）。halt 之后不再开新仓，直到人工解除。
 
-命名上的教训（来自 platform/backend/health.py）：那边叫
-`max_daily_loss_pct`，真实语义是"账户从初始值跌破阈值后的累计回撤"，代码里
-没有任何按日复位的逻辑，名字在骗人。这里叫 `max_drawdown_pct`，并且基准
+命名上的教训（来自 platform/backend/health.py）：那边这个阈值原本叫
+`max_daily_loss_pct`，但代码里没有任何按日复位的逻辑，名字在骗人——2026-10
+已改名为 `max_drawdown_pct`。这里同样叫 `max_drawdown_pct`，并且基准
 （peak_equity）是持久化的——它真的不会按天或按重启复位。
+
+两边的阈值数字故意不一样，不是漏改：platform 自动交易是 5x + 固定 100 USDT
+名义，一次止损约 3 USDT，账户回撤 25% 就已经是事故；这里是 10x + 100% 权益，
+一次止损就是 30% 权益，25% 会在第一次正常止损时误触发。同一个数字放进两套
+敞口里，必然有一边是在噪声上刹车。见 platform/backend/main.py 的 RISK_LIMITS。
 
 盈亏基准怎么定的：equity 一律从 `broker.verify_demo()` 拿（`fetch_balance`
 的 USDT total，含未实现盈亏和已扣的手续费），而不是自己拿仓位和价格去算。

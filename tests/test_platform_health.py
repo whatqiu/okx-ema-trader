@@ -207,7 +207,7 @@ def pos(**kw) -> dict:
 
 
 LIMITS = health.RiskLimits(enabled=True, max_loss_pct=60.0,
-                           max_daily_loss_pct=25.0, max_consecutive_losses=5,
+                           max_drawdown_pct=25.0, max_consecutive_losses=5,
                            liq_buffer_pct=3.0)
 
 
@@ -269,7 +269,7 @@ def test_one_loss_short_of_streak_does_not_fire():
 
 def test_disabled_breaker_never_fires():
     off = health.RiskLimits(enabled=False, max_loss_pct=1.0,
-                            max_daily_loss_pct=1.0, max_consecutive_losses=1,
+                            max_drawdown_pct=1.0, max_consecutive_losses=1,
                             liq_buffer_pct=99.0)
     d = health.evaluate_risk([pos(unrealised_pnl=-9999.0, mark_price=1.0)],
                              equity=1, baseline=10000, limits=off,

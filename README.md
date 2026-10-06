@@ -260,35 +260,45 @@ start-platform.bat          rem 启动 http://127.0.0.1:8788
 
 已经有的：`Ledger` 持仓账本（`state.yaml`，首次真实持仓时生成）、每轮对账
 （`reconciled N symbol(s)`）、开仓时把止损写进同一请求、止损没挂上就自动平掉、
-demo 门禁、回测与实盘共用策略、限速、合约规格换算。
+demo 门禁、回测与实盘共用策略、限速、合约规格换算、账户级熔断。
 
-**熔断只覆盖了一半，这是当前最大的缺口。**
+**两条下单路径都有账户级熔断了**（`9c35a24` 之前只有 `platform/` 有）。
 
-`platform/backend/health.py` 实现了账户级风险闸（单仓亏损上限、单日亏损上限、
-连亏次数、逼近强平价提前出场），并且接进了平台的自动交易循环。但它**只服务于
-模拟盘**：
+| 路径 | 会真的下单吗 | 账户级熔断 | 阈值写在哪 |
+|---|---|---|---|
+| `executor.py` | **是**，OKX demo 盘 | 有（`risk_guard.Guard`） | `config/config.yaml` 的 `risk:` 段 |
+| `platform/` 自动交易 | 否，paper account | 有（`health.enforce_risk`） | `platform/backend/main.py` 的 `RISK_LIMITS` |
 
-| 路径 | 会真的下单吗 | 有账户级熔断吗 |
-|---|---|---|
-| `platform/` 自动交易 | 否，paper account | **有**（`health.enforce_risk`） |
-| `executor.py` | **是**，OKX demo 盘 | **没有** |
+两条路径的阈值**故意不一样，不是漏改**：
 
-`executor.py` 唯一的保护是单笔 3% 止损。`config.yaml` 现在是满仓 10x
-（`equity_pct: 100`、`leverage: 10`），也就是说会真下单的那条路径上没有总闸 ——
-这正是"系统自己不会停下来"的场景。**在跑 `executor` 之前先把熔断补上，或者
-先只用 `--dry-run`。**
+| | 账户回撤上限 | 连亏停手 | 单仓上限 |
+|---|---|---|---|
+| `executor.py` | 60% | 3 笔 | 30% 账户权益（= 3% 止损 × 10x） |
+| `platform/` | 25% | 5 笔 | 60% 该仓位的保证金 |
+
+原因是敞口根本不同：`executor` 是 10x + 100% 权益，一次正常止损就亏掉 30%
+权益，25% 会在**第一次**止损时误触发；`platform` 自动交易默认 5x + 固定 100
+USDT 名义，一次止损约 3 USDT，跌到 25% 已经是事故。同一个数字塞进两套敞口，
+必然有一边是在噪声上刹车。（另外 `platform` 的单仓上限按"该仓位的保证金"计，
+`executor` 按"账户权益"计——分母不同，别照抄。）
+
+熔断触发后是 **halt（停手）**，不是只平仓：只平仓会让机器人立刻按同一套逻辑
+再开一笔，反复摩擦手续费。halt 会持久化，重启不解除，需要人工 `--reset-halt`
+或 `/api/risk/reset`。
 
 其他还没有的：
 
-- **FSM 状态机**。`executor` 现在是无状态的：每轮看指标 + 看账本决定动作，没有
-  "连续亏损 N 次进入冷却"之类跨周期的状态。
+- **按时间冷却**。`executor` 仍然是无状态的：每轮看指标 + 看账本决定动作。连亏
+  计数已经有了（存在 `state.yaml` 的 `risk` 段，重启不丢），但"亏完休息 N 根
+  K 线再回来"这种跨周期的时间冷却还没有。
 - **行情缓存落盘**（仅 `executor`）。`platform/` 已经把 K 线存进
-  `data/platform.db` 并只补缺口，但 `executor` 每次启动仍重新拉全量历史，
-  断线重连靠重新预热。
+  `data/platform.db`、只补缺口，并且断线重连后会自动补回中间那段空洞
+  （`Store.candle_gaps()` + 轮询器的 heal）；`executor` 每次启动仍重新拉全量
+  历史，断线重连靠重新预热。
 - **成本模型校准**。默认的 5 bps 手续费 + 3 bps 滑点是估算值，没有用真实成交回填验证过。
 
-下一步的建议顺序：先把 `health.enforce_risk` 接到 `executor.py`（会真下单的那条
-路径目前没有总闸），再考虑别的。
+下一步的建议顺序：给后端路由补测试（`tests/test_platform_routes.py` 是开头，
+22 个路由目前覆盖极少），再考虑把 `main.py` 按域拆成多个 router 模块。
 
 `logs/` 是运行产物（已被 `.gitignore` 忽略），程序跑起来会自动写入。
 历史清理掉的东西（含 `smoke_order.py` DEMO 下单冒烟测试）在

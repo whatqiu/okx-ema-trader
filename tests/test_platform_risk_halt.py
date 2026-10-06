@@ -96,7 +96,7 @@ def short_sig(*a, **kw):
 
 
 LIMITS = health.RiskLimits(enabled=True, max_loss_pct=60.0,
-                           max_daily_loss_pct=25.0, max_consecutive_losses=5,
+                           max_drawdown_pct=25.0, max_consecutive_losses=5,
                            liq_buffer_pct=3.0)
 
 

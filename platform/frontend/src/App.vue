@@ -515,7 +515,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
         </span>
         <span class="conn-badge" v-if="status && riskActive"
               :class="losingStreak > 0 ? 'warn' : 'muted'"
-              :title="`风控：单仓浮亏 >${status.risk.limits.max_loss_pct}% 强平｜账户回撤 >${status.risk.limits.max_daily_loss_pct}% 强平｜连亏 ${status.risk.limits.max_consecutive_losses} 次停手`">
+              :title="`风控：单仓浮亏 >${status.risk.limits.max_loss_pct}% 强平｜账户回撤 >${status.risk.limits.max_drawdown_pct}% 强平｜连亏 ${status.risk.limits.max_consecutive_losses} 次停手`">
           风控 {{ losingStreak > 0 ? `连亏${losingStreak}` : '启用' }}
         </span>
         <button class="btn ghost" :class="{ on: autoRefresh }" @click="toggleAuto"
