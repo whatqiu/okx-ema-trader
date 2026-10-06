@@ -142,21 +142,80 @@ function fmtPrice(v) {
 
 <style scoped>
 .picker { position: relative; }
+
+/* 搜索框：接入统一令牌，宽度给足以容纳 "BTC/USDT 永续" 这类文本 */
+.symbol-input {
+  width: 210px;
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-3);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  color: var(--tx-primary);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  outline: none;
+  transition: border-color var(--dur-fast) var(--ease),
+              box-shadow var(--dur-fast) var(--ease);
+}
+.symbol-input:hover { border-color: var(--line-strong); }
+.symbol-input:focus {
+  border-color: var(--c-accent);
+  box-shadow: 0 0 0 3px var(--c-accent-soft);
+}
+.symbol-input::placeholder { color: var(--tx-disabled); }
+
 .dropdown {
-  position: absolute; top: calc(100% + 4px); left: 0; z-index: 50;
-  width: 320px; max-height: 380px; overflow-y: auto;
-  background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  position: absolute;
+  top: calc(100% + var(--sp-1));
+  left: 0;
+  z-index: var(--z-dropdown);
+  width: 380px;
+  max-height: 400px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--bg-overlay);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--sh-lg);
+  padding: var(--sp-1);
 }
+
 .dd-label {
-  padding: 5px 10px 2px; font-size: 10px; color: var(--dim);
-  text-transform: uppercase; letter-spacing: 0.5px;
+  padding: var(--sp-2) var(--sp-3) var(--sp-1);
+  font-size: var(--fs-2xs);
+  color: var(--tx-tertiary);
+  letter-spacing: 0.04em;
 }
+
 .dd-item {
-  display: flex; align-items: baseline; gap: 6px;
-  padding: 6px 10px; cursor: pointer; white-space: nowrap;
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  /* 行高 34px：低于这个值鼠标难以准确指到某一行，
+     而误选币种会直接导致看错行情。 */
+  min-height: 34px;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  white-space: nowrap;
 }
-.dd-item.hl { background: rgba(240, 185, 11, 0.12); }
-.dd-right { margin-left: auto; display: flex; gap: 10px; font-size: 12px; }
-.dd-note { padding: 8px 10px; color: var(--dim); font-size: 12px; }
+.dd-item b { font-size: var(--fs-sm); }
+.dd-item.hl { background: var(--c-accent-soft); }
+
+.dd-right {
+  margin-left: auto;
+  display: flex;
+  gap: var(--sp-3);
+  font-family: var(--ff-num);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-xs);
+}
+
+.dd-note { padding: var(--sp-3); color: var(--tx-tertiary); font-size: var(--fs-xs); }
+.dd-note.warn { color: var(--c-warn); }
+
+.up { color: var(--c-up); }
+.down { color: var(--c-down); }
+.dim { color: var(--tx-tertiary); }
 </style>

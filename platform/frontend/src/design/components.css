@@ -1,0 +1,497 @@
+/* ==========================================================================
+   OKX EMA Trader — 基础组件层
+   --------------------------------------------------------------------------
+   只包含被复用的基础件。业务组件（交易台、信号流等）不写在这里。
+   凡是出现第二次的样式就该往这里提，这是本文档存在的唯一理由。
+   ========================================================================== */
+
+/* ======================= 面板 ======================= */
+.panel {
+  background: var(--bg-base);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.panel--pad { padding: var(--sp-4); }
+
+/* 面板标题：小字号 + 字重提升 + 中等灰。
+   不用 uppercase：中文没有大小写形态变化，uppercase 对汉字无效，
+   却会让英文缩写显得吵。 */
+.panel__title {
+  margin: 0;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-bold);
+  color: var(--tx-secondary);
+  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.panel__count {
+  font-family: var(--ff-num);
+  font-size: var(--fs-xs);
+  color: var(--tx-tertiary);
+  background: var(--bg-raised);
+  border-radius: var(--r-full);
+  padding: 1px var(--sp-2);
+}
+
+/* ======================= 按钮 ======================= */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-4);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  line-height: 1;
+  color: var(--tx-primary);
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+  transition: background var(--dur-fast) var(--ease),
+              border-color var(--dur-fast) var(--ease),
+              transform var(--dur-fast) var(--ease);
+}
+
+.btn:hover:not(:disabled) { background: var(--bg-overlay); border-color: var(--line-strong); }
+
+/* 按下时下沉 1px：给触觉反馈一个视觉替身，键盘用户也能感知到"生效了"。 */
+.btn:active:not(:disabled) { transform: translateY(1px); }
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn--primary {
+  background: var(--c-accent);
+  color: var(--c-accent-ink);
+  border-color: transparent;
+  font-weight: var(--fw-bold);
+}
+.btn--primary:hover:not(:disabled) { background: var(--c-accent-hover); border-color: transparent; }
+
+.btn--ghost {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--tx-secondary);
+}
+.btn--ghost:hover:not(:disabled) { background: var(--bg-hover); color: var(--tx-primary); }
+
+.btn--ghost.is-on {
+  background: var(--c-accent-soft);
+  border-color: var(--c-accent);
+  color: var(--c-accent);
+}
+
+.btn--danger {
+  background: var(--c-down);
+  color: #fff;
+  border-color: transparent;
+  font-weight: var(--fw-bold);
+}
+.btn--danger:hover:not(:disabled) { background: #d63e50; border-color: transparent; }
+
+.btn--lg { min-height: 42px; font-size: var(--fs-base); }
+.btn--block { width: 100%; }
+
+.btn--icon {
+  min-width: var(--tap-min);
+  padding: 0;
+  font-size: var(--fs-md);
+}
+
+/* ======================= 表单 ======================= */
+.field { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+
+.field__label {
+  font-size: var(--fs-xs);
+  color: var(--tx-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.input,
+.select {
+  min-height: var(--tap-min);
+  width: 100%;
+  padding: 0 var(--sp-3);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  color: var(--tx-primary);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  outline: none;
+  transition: border-color var(--dur-fast) var(--ease),
+              box-shadow var(--dur-fast) var(--ease);
+}
+
+.input:hover, .select:hover { border-color: var(--line-strong); }
+
+.input:focus, .select:focus {
+  border-color: var(--c-accent);
+  box-shadow: 0 0 0 3px var(--c-accent-soft);
+}
+
+.input::placeholder { color: var(--tx-disabled); }
+
+/* 数字输入：强制等宽，避免位数变化时宽度跳动 */
+.input--num { font-family: var(--ff-num); font-variant-numeric: tabular-nums; }
+
+.select {
+  appearance: none;
+  padding-right: var(--sp-6);
+  cursor: pointer;
+  /* 下拉箭头用内联SVG画，不依赖任何图标字体或图片资源 */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%237b8697' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right var(--sp-3) center;
+}
+.select option { background: var(--bg-raised); color: var(--tx-primary); }
+
+/* 滑块 */
+.slider {
+  width: 100%;
+  height: 22px;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: var(--r-full);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+}
+.slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px; height: 16px;
+  margin-top: -7px;
+  border-radius: 50%;
+  background: var(--c-accent);
+  border: 2px solid var(--bg-base);
+  box-shadow: var(--sh-sm);
+  transition: transform var(--dur-fast) var(--ease);
+}
+.slider::-webkit-slider-thumb:hover { transform: scale(1.15); }
+
+/* 复选框 */
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--tx-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+.check input { width: 15px; height: 15px; accent-color: var(--c-accent); cursor: pointer; }
+
+/* ======================= 芯片 / 标签 ======================= */
+/* 快捷数值按钮。交易界面里这些比输入框更常用——没有人愿意为100 USDT
+   去键盘敲三个字符。 */
+.chip {
+  min-height: 28px;
+  padding: 0 var(--sp-3);
+  font-family: var(--ff-num);
+  font-size: var(--fs-xs);
+  color: var(--tx-secondary);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease);
+}
+.chip:hover { color: var(--tx-primary); border-color: var(--line-strong); }
+.chip.is-on {
+  color: var(--c-accent);
+  background: var(--c-accent-soft);
+  border-color: var(--c-accent);
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px var(--sp-2);
+  font-size: var(--fs-2xs);
+  font-weight: var(--fw-medium);
+  line-height: 1.6;
+  border-radius: var(--r-sm);
+  white-space: nowrap;
+}
+.tag--up { color: var(--c-up); background: var(--c-up-soft); }
+.tag--down { color: var(--c-down); background: var(--c-down-soft); }
+.tag--warn { color: var(--c-warn); background: var(--c-warn-soft); }
+.tag--info { color: var(--c-info); background: var(--c-info-soft); }
+.tag--muted { color: var(--tx-tertiary); background: var(--bg-raised); }
+
+/* 可删除的监控币种 */
+.token {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 3px var(--sp-1) 3px var(--sp-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--tx-primary);
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+}
+.token__x {
+  display: grid;
+  place-items: center;
+  width: 18px; height: 18px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--tx-tertiary);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease);
+}
+.token__x:hover { background: var(--c-down-soft); color: var(--c-down); }
+
+/* ======================= 键值表 ======================= */
+.kv { display: flex; flex-direction: column; }
+
+.kv__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.kv__row:last-child { border-bottom: 0; }
+
+.kv__k { font-size: var(--fs-xs); color: var(--tx-tertiary); white-space: nowrap; }
+.kv__v {
+  font-family: var(--ff-num);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  text-align: right;
+}
+
+/* ======================= 状态徽标 ======================= */
+/* 三重编码：颜色 + 圆点 + 文字标签。
+   只用颜色区分状态是典型的可用性缺陷——约 8% 的男性有色觉障碍，
+   而"已连接/断网"这个判断错误的代价是用户误以为行情正常。 */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 24px;
+  padding: 0 var(--sp-3);
+  font-size: var(--fs-xs);
+  border: 1px solid var(--line);
+  border-radius: var(--r-full);
+  color: var(--tx-secondary);
+  background: var(--bg-raised);
+  white-space: nowrap;
+  cursor: default;
+}
+.badge__dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+.badge--ok { color: var(--c-up); border-color: var(--c-up-line); background: var(--c-up-soft); }
+.badge--bad { color: var(--c-down); border-color: var(--c-down-line); background: var(--c-down-soft); }
+.badge--warn { color: var(--c-warn); border-color: rgba(232,163,61,0.4); background: var(--c-warn-soft); }
+.badge--idle { color: var(--tx-tertiary); }
+
+/* 呼吸动画：仅用于"正在进行中"的状态（连接中等）。
+   静止的状态（已连接/断网）不闪——闪烁会诱发焦虑且无信息量。 */
+.badge--pulse .badge__dot { animation: pulse 2s var(--ease) infinite; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.8); }
+}
+
+/* ======================= 横幅 ======================= */
+/* 横幅只在状态异常时出现，占据整行 —— 异常信息不该藏在某个面板角落。 */
+.banner {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  padding: var(--sp-3) var(--sp-4);
+  font-size: var(--fs-sm);
+  border-bottom: 1px solid var(--line-soft);
+}
+.banner__strong { font-weight: var(--fw-bold); }
+.banner__detail { font-size: var(--fs-xs); color: var(--tx-tertiary); }
+.banner__spacer { margin-left: auto; }
+
+.banner--danger { background: var(--c-down-soft); color: var(--c-down); border-bottom-color: var(--c-down-line); }
+.banner--warn { background: var(--c-warn-soft); color: var(--c-warn); border-bottom-color: rgba(232,163,61,0.35); }
+.banner--ok { background: var(--c-up-soft); color: var(--c-up); border-bottom-color: var(--c-up-line); }
+.banner--info { background: var(--c-info-soft); color: var(--c-info); border-bottom-color: rgba(76,141,246,0.35); }
+
+/* ======================= 标签页 ======================= */
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--bg-sunken);
+  border-radius: var(--r-md);
+}
+
+.tabs__btn {
+  flex: 1;
+  min-height: 30px;
+  padding: 0 var(--sp-3);
+  font-family: inherit;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--tx-tertiary);
+  background: transparent;
+  border: 0;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease);
+}
+.tabs__btn:hover { color: var(--tx-secondary); background: var(--bg-hover); }
+.tabs__btn.is-active {
+  color: var(--tx-primary);
+  background: var(--bg-raised);
+  box-shadow: var(--sh-sm);
+}
+
+/* ======================= 分段控件（多空切换） ======================= */
+.segment { display: flex; gap: var(--sp-2); }
+
+.segment__btn {
+  flex: 1;
+  min-height: 40px;
+  font-family: inherit;
+  font-size: var(--fs-base);
+  font-weight: var(--fw-bold);
+  color: var(--tx-tertiary);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease);
+}
+.segment__btn:hover { border-color: var(--line-strong); }
+
+.segment__btn.is-long {
+  color: var(--c-up);
+  background: var(--c-up-soft);
+  border-color: var(--c-up-line);
+}
+.segment__btn.is-short {
+  color: var(--c-down);
+  background: var(--c-down-soft);
+  border-color: var(--c-down-line);
+}
+
+/* ======================= 空状态 ======================= */
+/* 空白区域要解释"为什么空"和"接下来做什么"，否则用户以为页面坏了。 */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: var(--sp-8) var(--sp-4);
+  text-align: center;
+  color: var(--tx-tertiary);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  flex: 1;
+  min-height: 0;
+}
+.empty__icon { font-size: 22px; opacity: 0.4; line-height: 1; }
+
+/* ======================= 滚动区 ======================= */
+.scroll {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  min-height: 0;
+  flex: 1;
+}
+
+/* ======================= 吐司 ======================= */
+.toast-stack {
+  position: fixed;
+  right: var(--sp-5);
+  bottom: var(--sp-5);
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  max-width: 380px;
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--bg-overlay);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--c-info);
+  border-radius: var(--r-md);
+  box-shadow: var(--sh-lg);
+  font-size: var(--fs-sm);
+  color: var(--tx-primary);
+  pointer-events: auto;
+  animation: toast-in var(--dur) var(--ease);
+}
+.toast--ok { border-left-color: var(--c-up); }
+.toast--bad { border-left-color: var(--c-down); }
+.toast--warn { border-left-color: var(--c-warn); }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* ======================= 分隔 ======================= */
+.divider { height: 1px; background: var(--line-soft); border: 0; margin: 0; }
+
+/* 键值紧凑横排：用于图表下方的行情摘要 */
+.inline-stats {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  flex-wrap: wrap;
+}
+.inline-stats__item { display: flex; flex-direction: column; gap: 1px; }
+.inline-stats__k { font-size: var(--fs-2xs); color: var(--tx-tertiary); }
+.inline-stats__v {
+  font-family: var(--ff-num);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+}
+
+/* ======================= 移动端 ======================= */
+/* 移动端不能靠缩小字号来塞内容——改为纵向堆叠 + 触控目标放大到 44px。 */
+@media (max-width: 860px) {
+  .btn, .input, .select { min-height: var(--tap-min-touch); }
+  .inline-stats { gap: var(--sp-4); }
+}

@@ -9,12 +9,55 @@
 // constants if you prefer the Chinese A-share convention (red up).
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
-const UP = '#0ecb81'
-const DOWN = '#f6465d'
-const GRID = 'rgba(255,255,255,0.06)'
-const TEXT = '#848e9c'
+// canvas 的 fillStyle/strokeStyle 只接受字面量颜色，无法直接用 CSS 变量。
+// 因此颜色必须从计算样式读出来再喂给 ctx。
+// 代价是切换主题后要重绘 —— 所以下面用 MutationObserver 盯着
+// data-theme 的变化；否则用户在浅色下看到的会是一块黑底图表。
+const cssVar = (name, fallback) => {
+  if (typeof window === 'undefined') return fallback
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+  return v || fallback
+}
+
+let UP = '#1fc98b'
+let DOWN = '#f2495c'
+let GRID = 'rgba(255,255,255,0.06)'
+let TEXT = '#7b8697'
+let BG = '#11151d'
+let CHART_BG = '#0a0d12'
+let LABEL_BG = '#171c26'
+let LABEL_TX = '#e9edf4'
+let CURSOR = 'rgba(255,255,255,0.25)'
+
 const EMA_FAST_COLOR = '#f0b90b'
 const EMA_SLOW_COLOR = '#7b9fff'
+
+function readTheme() {
+  UP = cssVar('--c-up', UP)
+  DOWN = cssVar('--c-down', DOWN)
+  GRID = cssVar('--line-soft', GRID)
+  TEXT = cssVar('--tx-tertiary', TEXT)
+  BG = cssVar('--bg-sunken', BG)
+  CHART_BG = cssVar('--bg-sunken', CHART_BG)
+  LABEL_BG = cssVar('--bg-raised', LABEL_BG)
+  LABEL_TX = cssVar('--tx-primary', LABEL_TX)
+  CURSOR = cssVar('--line-strong', CURSOR)
+}
+readTheme()
+
+// 主题切换时重绘。观察的是 <html> 的 data-theme 属性。
+let themeObserver = null
+function watchTheme() {
+  if (themeObserver || typeof MutationObserver === 'undefined') return
+  themeObserver = new MutationObserver(() => {
+    readTheme()
+    draw()
+  })
+  themeObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['data-theme'],
+  })
+}
 
 const props = defineProps({
   rows: { type: Array, default: () => [] },       // [[ts,o,h,l,c,vol,confirm], ...] oldest first
@@ -262,7 +305,9 @@ function draw() {
     ctx.fillStyle = color
     const label = formatPrice(lastPrice.value)
     ctx.fillRect(W - PAD_R, yy - 9, PAD_R - 4, 16)
-    ctx.fillStyle = '#0b0e11'
+    // 压在涨跌色块上的文字用固定深色墨，不跟随主题：
+// 无论涨跌色块本身多亮/多暗，深色墨都能保持 4.5:1 以上的对比。
+ctx.fillStyle = '#0a0d12'
     ctx.fillText(label, W - PAD_R + 6, yy + 3)
   }
 
@@ -280,16 +325,16 @@ function draw() {
     const i = Math.round((mx - PAD_L) / slot - 0.5)
     if (i >= 0 && i < count && my < priceH + volH + 8) {
       const r = slice[i]
-      ctx.strokeStyle = 'rgba(255,255,255,0.25)'
+      ctx.strokeStyle = CURSOR
       ctx.setLineDash([3, 3])
       ctx.beginPath(); ctx.moveTo(x(i), 0); ctx.lineTo(x(i), volTop + volH); ctx.stroke()
       ctx.beginPath(); ctx.moveTo(PAD_L, my); ctx.lineTo(W - PAD_R, my); ctx.stroke()
       ctx.setLineDash([])
       const p = lo + (1 - my / priceH) * (hi - lo)
       if (my <= priceH) {
-        ctx.fillStyle = '#2b3139'
+        ctx.fillStyle = LABEL_BG
         ctx.fillRect(W - PAD_R, my - 9, PAD_R - 4, 16)
-        ctx.fillStyle = '#eaecef'
+        ctx.fillStyle = LABEL_TX
         ctx.textAlign = 'left'
         ctx.fillText(formatPrice(p), W - PAD_R + 6, my + 3)
       }
@@ -360,9 +405,14 @@ onMounted(() => {
   canvas.addEventListener('wheel', onWheel, { passive: false })
   canvas.addEventListener('dblclick', resetView)
   resize()
+  watchTheme()
 })
 onBeforeUnmount(() => {
   resizeObserver?.disconnect()
+  // 必须断开观察器：这个组件在标签页切换时会被反复挂载/卸载，
+  // 泄漏的观察器会累积并对每次主题变化重复触发 draw。
+  themeObserver?.disconnect()
+  themeObserver = null
   window.removeEventListener('mouseup', onUp)
 })
 // New data must not yank a panned view back to the edge: only redraw.
@@ -386,18 +436,24 @@ watch(() => [props.rows, props.markers], draw, { deep: true })
 .kline-wrap { position: relative; width: 100%; height: 100%; }
 .kline-canvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
 .kline-legend {
-  position: absolute; top: 4px; right: 72px; z-index: 2;
-  display: flex; gap: 12px; font-size: 11px; pointer-events: none;
+  position: absolute; top: var(--sp-2); right: 76px; z-index: 2;
+  display: flex; gap: var(--sp-3); align-items: center;
+  font-size: var(--fs-xs); pointer-events: none;
 }
-.ema-fast { color: #f0b90b; }
-.ema-slow { color: #7b9fff; }
-.up { color: #0ecb81; }
-.down { color: #f6465d; }
-.hint { color: #565f6b; }
+.ema-fast { color: var(--c-accent); }
+.ema-slow { color: var(--c-info); }
+.up { color: var(--c-up); }
+.down { color: var(--c-down); }
+.hint { color: var(--tx-disabled); }
 .back-live {
-  position: absolute; right: 70px; bottom: 18%; z-index: 3;
-  background: #2b3139; color: #eaecef; border: 1px solid #3a424c;
-  border-radius: 4px; width: 28px; height: 28px; cursor: pointer; font-size: 15px;
+  position: absolute; right: var(--sp-4); bottom: 18%; z-index: 3;
+  min-width: 28px; height: 28px;
+  display: grid; place-items: center;
+  background: var(--bg-raised); color: var(--tx-primary);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  cursor: pointer; font-size: var(--fs-md);
+  transition: background var(--dur-fast) var(--ease);
 }
-.back-live:hover { background: #3a424c; }
+.back-live:hover { background: var(--bg-overlay); }
 </style>

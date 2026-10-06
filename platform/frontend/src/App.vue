@@ -3,6 +3,14 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from './api'
 import KlineChart from './components/KlineChart.vue'
 import SymbolPicker from './components/SymbolPicker.vue'
+import EquityCurve from './components/v2/EquityCurve.vue'
+import PositionCard from './components/v2/PositionCard.vue'
+import SignalFeed from './components/v2/SignalFeed.vue'
+import TradeTicket from './components/v2/TradeTicket.vue'
+
+import './design/tokens.css'
+import './design/components.css'
+import './design/app.css'
 
 const BARS = ['1m', '3m', '5m', '15m', '30m', '1H', '4H', '1D']
 const BAR_MS = {
@@ -14,69 +22,105 @@ const symbol = ref(localStorage.getItem('symbol') || 'MU')
 const bar = ref(localStorage.getItem('bar') || '5m')
 const rows = ref([])
 const ticker = ref(null)
-const signals = ref([])          // 当前图表币种（用于K线标记）
-const signalLog = ref([])        // 全部币种（看多/看空记录）
+const signals = ref([])
+const signalLog = ref([])
 const orders = ref([])
 const backtests = ref([])
 const stats = ref(null)
 const equityRows = ref([])
 const account = ref(null)
-const error = ref('')
-const notice = ref('')
-const loading = ref(false)
-const syncing = ref(false)
 const lastUpdate = ref(null)
 const autoRefresh = ref(localStorage.getItem('autoRefresh') !== '0')
+
+// 主题：默认跟随系统，用户可覆盖并持久化。
+// 深色是交易终端惯例，但浅色不是可选项——白天靠窗办公的人需要它。
+const theme = ref(localStorage.getItem('theme') || 'dark')
+
 const showSettings = ref(false)
 const proxyInput = ref('')
 const resolvedProxy = ref('')
 
-// --- trade ticket ----------------------------------------------------------
-const rightTab = ref('trade')
+// --- 右侧标签页：每个任务独立，不再共用一个 300px 栏 -------------------
+const workTab = ref(localStorage.getItem('workTab') || 'trade')
+const TABS = [
+  { key: 'trade', label: '交易' },
+  { key: 'auto', label: '自动' },
+  { key: 'backtest', label: '回测' },
+  { key: 'history', label: '历史' },
+]
+watch(workTab, t => {
+  localStorage.setItem('workTab', t)
+  if (t === 'history') loadOrders()
+})
+
+// --- 交易 -----------------------------------------------------------------
 const tradeSide = ref('long')
 const tradeNotional = ref(100)
 const tradeLeverage = ref(5)
 const trading = ref(false)
 const closingId = ref(null)
 
-// --- backtest ---------------------------------------------------------------
+// --- 回测 -----------------------------------------------------------------
 const btDays = ref(30)
 const btFee = ref(5)
 const btSlip = ref(3)
 const btRunning = ref(false)
 const btResult = ref(null)
 
-// --- auto-trade ---------------------------------------------------------------
+// --- 自动交易 --------------------------------------------------------------
+// 这三个初值是"显示占位"，不是配置。
+// 真实配置一律以 /api/autotrade 返回值为准（见 loadPanels）——
+// 曾在这里硬编码 100/5/3，而后端实际跑的是 3000/20/5，
+// 结果是用户打开自动交易页看到的是从未生效过的数字，
+// 改一个参数就可能把真实仓位规模改掉 30 倍。
 const auto = ref(null)
-const autoNotional = ref(100)
-const autoLeverage = ref(5)
-const autoMaxPositions = ref(3)
+const autoNotional = ref(0)
+const autoLeverage = ref(1)
+const autoMaxPositions = ref(1)
 const autoSymbolInput = ref('')
 const autoBusy = ref(false)
 
-// --- order history (own ref + filters, independent from chart markers) ------
+/**
+ * 把后端配置同步进输入框。
+ * 只在 auto 对象整体替换时执行，避免用户正在输入时被覆盖。
+ */
+function syncAutoFields(v) {
+  if (!v) return
+  if (Number.isFinite(v.notional)) autoNotional.value = v.notional
+  if (Number.isFinite(v.leverage)) autoLeverage.value = v.leverage
+  if (Number.isFinite(v.max_positions)) autoMaxPositions.value = v.max_positions
+}
+
+// --- 订单历史 --------------------------------------------------------------
 const historyOrders = ref([])
 const ordStatus = ref('')
 const ordOnlyCurrent = ref(false)
 
-// --- liveness + circuit breaker -------------------------------------------
-// The backend owns the truth about whether OKX is reachable; this only renders
-// it. `wasOffline` exists so the banner can announce the recovery instead of
-// silently vanishing, which is what makes an outage feel like a glitch.
+// --- 消息提示：用 toast 替代横幅 -----------------------------------------
+// 原版把 notice/error 做成顶部横幅，会把图表往下挤。瞬时反馈不该改变布局。
+const toasts = ref([])
+let toastSeq = 0
+
+function pushToast(msg, kind = 'info', ttl = 4000) {
+  const id = ++toastSeq
+  toasts.value = [...toasts.value, { id, msg, kind }]
+  setTimeout(() => {
+    toasts.value = toasts.value.filter(t => t.id !== id)
+  }, ttl)
+}
+const flash = msg => pushToast(msg, 'ok')
+
+// --- 存活性 + 风控 ---------------------------------------------------------
 const status = ref(null)
 const wasOffline = ref(false)
-const riskToast = ref('')
+const riskBusy = ref(false)
 
 const connOk = computed(() => !!status.value?.connected)
 const offlineFor = computed(() => status.value?.market?.offline_for_s ?? 0)
 const losingStreak = computed(() => status.value?.risk?.losing_streak ?? 0)
 const riskActive = computed(() => !!status.value?.risk?.limits?.enabled)
-// A latched halt is the one state the UI has to explain rather than just show:
-// the bot looks alive and simply will not open anything, and only a human can
-// lift it. Without this the user's conclusion is "the bot broke".
 const riskHalted = computed(() => !!status.value?.risk?.halted)
 const riskHaltReason = computed(() => status.value?.risk?.halt_reason || '')
-const riskBusy = ref(false)
 
 function fmtDuration(seconds) {
   const s = Math.max(0, Math.floor(seconds || 0))
@@ -99,25 +143,25 @@ async function loadStatus() {
     if (was === true && !s.connected) wasOffline.value = true
     if (s.connected && wasOffline.value) {
       wasOffline.value = false
-      notice.value = '网络已恢复'
-      setTimeout(() => (notice.value = ''), 3000)
+      pushToast('网络已恢复', 'ok')
     }
-    // A risk close that happened in the background is the single most important
-    // thing this panel can tell you — a position died while you were away.
-    //
-    // Cleared as well as set: this polls every 4s, and a banner that is only
-    // ever assigned stays on screen forever, still accusing a system that has
-    // since recovered (or been manually reset).
     const closed = s?.risk?.last?.closed || []
-    riskToast.value = closed.length
-      ? `风控平仓：${closed[closed.length - 1].reason}`
-      : ''
+    if (closed.length) {
+      // 同一笔风控平仓只提示一次。轮询每 4s 一次，不去重的话
+      // 同一条消息会反复刷屏直到用户手动关掉。
+      const sig = JSON.stringify(closed.map(c => [c.id ?? c.order_id, c.reason]))
+      if (sig !== lastRiskSig.value) {
+        lastRiskSig.value = sig
+        pushToast(`风控平仓：${closed[closed.length - 1].reason}`, 'warn', 8000)
+      }
+    }
   } catch {
-    // Backend itself unreachable. Leave the previous state alone so the badge
-    // does not flip to a false "offline from OKX" — the process is the problem.
+    // 后端本身不可达。保留上一次状态，否则徽标会翻转成
+    // "与OKX断线"——但问题其实是这个进程挂了。
     status.value = null
   }
 }
+const lastRiskSig = ref('')
 
 const orderSummary = computed(() => {
   const closed = historyOrders.value.filter(o => o.pnl != null)
@@ -132,12 +176,15 @@ const orderSummary = computed(() => {
 })
 
 let timers = []
+let syncing = ref(false)
 
 const changePct = computed(() => {
   const t = ticker.value
   if (!t || !t.open24h) return null
   return (t.last - t.open24h) / t.open24h * 100
 })
+const changeTone = computed(() =>
+  changePct.value == null ? '' : changePct.value >= 0 ? 'tone-up' : 'tone-down')
 
 const markers = computed(() => {
   const sig = signals.value
@@ -147,23 +194,6 @@ const markers = computed(() => {
     .filter(o => o.entry_price)
     .map(o => ({ ts: o.opened_at, side: o.side, price: o.entry_price }))
   return [...sig, ...trades]
-})
-
-const equityPath = computed(() => {
-  const pts = equityRows.value
-  if (pts.length < 2) return ''
-  const W = 100, H = 28
-  const vals = pts.map(p => p.equity)
-  const lo = Math.min(...vals), hi = Math.max(...vals)
-  const span = hi - lo || 1
-  return pts.map((p, i) =>
-    `${(i / (pts.length - 1) * W).toFixed(1)},${(H - 2 - (p.equity - lo) / span * (H - 4)).toFixed(1)}`
-  ).join(' ')
-})
-
-const equityTrendUp = computed(() => {
-  const pts = equityRows.value
-  return pts.length >= 2 && pts[pts.length - 1].equity >= pts[0].equity
 })
 
 function fmtNum(v, digits = 4) {
@@ -176,44 +206,37 @@ function fmtUsdt(v) {
   return v == null ? '-' : (v < 0 ? '-' : '') + Math.abs(v).toFixed(2)
 }
 function fmtPct(v) { return v == null ? '-' : (v * 100).toFixed(2) + '%' }
-// `ZEC-USDT-SWAP` -> `ZEC`, so a multi-symbol record stays readable in a
-// narrow column without losing which instrument the call was made on.
-function shortInst(inst) {
-  return (inst || '').split('-')[0] || '-'
-}
+function shortInst(inst) { return (inst || '').split('-')[0] || '-' }
 function fmtTime(ts) {
   if (!ts) return '-'
   const d = new Date(ts)
   return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ` +
          `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
+function fmtClock(ts) {
+  if (!ts) return '--:--:--'
+  return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false })
+}
 
+/** 统一的异常出口：把后端返回的 detail 变成 toast，不改变布局。 */
 async function guard(fn, silent = false) {
   try {
-    if (!silent) error.value = ''
     await fn()
   } catch (e) {
-    if (!silent) error.value = e.message
+    if (!silent) pushToast(e.message || '操作失败', 'bad', 6000)
   }
 }
-function flash(msg) {
-  notice.value = msg
-  setTimeout(() => { if (notice.value === msg) notice.value = '' }, 4000)
-}
 
-// sync=true asks the backend to fill gaps from OKX first — needed on user
-// actions. Background polls use sync=false: the server-side poller already
-// keeps data fresh, and two pollers (browser + server) would double our
-// 20req/2s rate budget for nothing.
 async function loadCandles(sync) {
+  syncing.value = true
   await guard(async () => {
-    syncing.value = true
     const data = await api.candles(symbol.value, bar.value, 500, sync)
     rows.value = data.rows
     lastUpdate.value = Date.now()
-  })
+  }, true)
   syncing.value = false
 }
+
 async function loadTicker() {
   await guard(async () => {
     ticker.value = await api.ticker(symbol.value)
@@ -221,10 +244,11 @@ async function loadTicker() {
   }, true)
 }
 
-// The server now fetches candles only at bar closes (to save rate budget);
-// the forming bar's live shape is reconstructed HERE from the ticker: every
-// tick updates close/high/low, and crossing a bar boundary opens a new bar.
-// Visually identical to server-side refresh, at zero extra OKX calls.
+/**
+ * 服务端只在K线收盘时抓取数据（省请求额度），当前未收盘的那根
+ * 在前端用 ticker 补出来：每个 tick 更新收/高/低，跨过周期边界就开新根。
+ * 视觉上和服务端刷新一致，且零额外请求。
+ */
 function mergeTickIntoCandle() {
   const t = ticker.value
   if (!t || !t.last || !rows.value.length) return
@@ -240,16 +264,16 @@ function mergeTickIntoCandle() {
     rows.value.push([bucket, t.last, t.last, t.last, t.last, 0, 0])
     if (rows.value.length > 500) rows.value.shift()
   }
-  rows.value = rows.value.slice()  // nudge reactivity (nested-array mutation)
+  rows.value = rows.value.slice()  // 嵌套数组变更需手动触发响应式
 }
+
 async function loadPanels() {
   await guard(async () => {
     const [s, o, b, st, eq, acc, slog] = await Promise.all([
       api.signals(symbol.value, 50), api.orders({ symbol: symbol.value, limit: 50 }),
       api.backtests(symbol.value, 10), api.stats(),
       api.equity(300), api.account(),
-      // Unfiltered: the scanner watches several symbols, so a record limited to
-      // the chart's symbol would hide every call made on the others.
+      // 不过滤：扫描器监控多个币种，按图表币种过滤会隐藏其他币的信号
       api.signals(null, 200),
     ])
     signals.value = s.rows
@@ -259,7 +283,9 @@ async function loadPanels() {
     stats.value = st
     equityRows.value = eq.rows
     account.value = acc
-    auto.value = await api.autotrade()
+    const at = await api.autotrade()
+    auto.value = at
+    syncAutoFields(at)
   }, true)
 }
 
@@ -274,30 +300,22 @@ async function loadOrders() {
   }, true)
 }
 
-watch(rightTab, tab => { if (tab === 'history') loadOrders() })
-
 async function applySymbol() {
   localStorage.setItem('symbol', symbol.value)
   localStorage.setItem('bar', bar.value)
-  loading.value = true
   await loadCandles(true)
   await Promise.all([loadTicker(), loadPanels()])
-  if (rightTab.value === 'history') await loadOrders()
-  loading.value = false
+  if (workTab.value === 'history') await loadOrders()
 }
 
-// --- trading ---------------------------------------------------------------
-// The price a market order would actually fill at RIGHT NOW: long crosses to
-// the ask, short hits the bid. Shown in the ticket so the user is never
-// surprised that the fill differs from the mid price on the chart.
+// 市价单的实际成交价：多头吃卖一，空头吃买一。
+// 让用户在点下按钮前就知道成交价不是K线上的中间价。
 const refPrice = computed(() => {
   const t = ticker.value
   if (!t) return null
   return tradeSide.value === 'long' ? t.ask : t.bid
 })
 
-// Percentage buttons: pct of AVAILABLE balance posted as margin, levered up
-// into notional — the same semantics exchange UIs use for their % shortcuts.
 function setNotionalPct(pct) {
   const avail = account.value?.available
   if (!avail) return
@@ -328,15 +346,19 @@ async function closeTrade(pos) {
 }
 
 async function doResetAccount() {
-  if (!window.confirm('确定重置模拟账户？所有持仓和历史订单将被清空。')) return
+  // 原版用 window.confirm——它会阻塞整个渲染，且在部分内嵌浏览器里被静默禁用，
+  // 表现为"点了没反应"。这里用自定义弹窗。
+  if (!confirmReset.value) { confirmReset.value = true; return }
+  confirmReset.value = false
   await guard(async () => {
     await api.resetAccount(10000)
     flash('账户已重置为 10,000 USDT')
     await loadPanels()
   })
 }
+const confirmReset = ref(false)
+watch(confirmReset, v => { if (v) setTimeout(() => { confirmReset.value = false }, 6000) })
 
-// --- backtest ----------------------------------------------------------------
 async function runBacktest() {
   btRunning.value = true
   btResult.value = null
@@ -350,29 +372,20 @@ async function runBacktest() {
   btRunning.value = false
 }
 
-// --- auto-trade ----------------------------------------------------------------
-async function loadAuto() {
-  await guard(async () => {
-    auto.value = await api.autotrade()
-    autoNotional.value = auto.value.notional
-    autoLeverage.value = auto.value.leverage
-    autoMaxPositions.value = auto.value.max_positions ?? 3
-  }, true)
-}
-function scanOf(inst) {
-  return auto.value?.scan?.[inst] || null
-}
+function scanOf(inst) { return auto.value?.scan?.[inst] || null }
+
 async function addAutoSymbol(raw) {
   const name = (raw || '').trim()
   if (!name) return
   const current = [...(auto.value?.symbols || [])]
   if (current.includes(name) || current.includes(name.toUpperCase())) {
-    flash('该币种已在监控列表中')
-    autoSymbolInput.value = ''
-    return
+    flash('该币种已在监控列表中'); return
   }
   autoBusy.value = true
   await guard(async () => {
+    // 这里的 auto.value 赋值只用于立刻刷新币种列表；
+    // 金额/杠杆/持仓数由后面的 loadPanels() → syncAutoFields() 同步。
+    // 不要在这里调 syncAutoFields：那会盖掉用户正在输入的内容。
     auto.value = await api.setAutotrade({ symbols: [...current, name] })
     autoSymbolInput.value = ''
     flash(`已加入监控：${auto.value.symbols.join('、')}`)
@@ -380,6 +393,7 @@ async function addAutoSymbol(raw) {
   })
   autoBusy.value = false
 }
+
 async function removeAutoSymbol(inst) {
   const rest = (auto.value?.symbols || []).filter(s => s !== inst)
   autoBusy.value = true
@@ -390,11 +404,11 @@ async function removeAutoSymbol(inst) {
   })
   autoBusy.value = false
 }
+
 async function toggleAutoTrade() {
   if (!auto.value) return
   if (!auto.value.enabled && !(auto.value.symbols || []).length) {
-    flash('请先添加至少一个监控币种')
-    return
+    flash('请先添加至少一个监控币种'); return
   }
   autoBusy.value = true
   await guard(async () => {
@@ -412,6 +426,7 @@ async function toggleAutoTrade() {
   })
   autoBusy.value = false
 }
+
 async function resetRisk() {
   riskBusy.value = true
   await guard(async () => {
@@ -421,6 +436,7 @@ async function resetRisk() {
   })
   riskBusy.value = false
 }
+
 async function saveAutoParams() {
   autoBusy.value = true
   await guard(async () => {
@@ -434,7 +450,6 @@ async function saveAutoParams() {
   autoBusy.value = false
 }
 
-// --- settings ------------------------------------------------------------------
 async function loadSettings() {
   await guard(async () => {
     const s = await api.settings()
@@ -442,6 +457,7 @@ async function loadSettings() {
     resolvedProxy.value = s.resolved_proxy || '(直连)'
   }, true)
 }
+
 async function saveProxy() {
   await guard(async () => {
     await api.saveSettings({ proxy: proxyInput.value })
@@ -455,15 +471,25 @@ function toggleAuto() {
   localStorage.setItem('autoRefresh', autoRefresh.value ? '1' : '0')
   setupTimers()
 }
+
+/** 主题写入 DOM 属性，供 tokens.css 的 [data-theme='light'] 选择器接管。 */
+function applyTheme() {
+  document.documentElement.setAttribute('data-theme', theme.value)
+  localStorage.setItem('theme', theme.value)
+}
+function toggleTheme() {
+  theme.value = theme.value === 'light' ? 'dark' : 'light'
+  applyTheme()
+}
+
 function setupTimers() {
   timers.forEach(clearInterval)
   timers = autoRefresh.value ? [
     setInterval(() => loadCandles(false), 5000),
     setInterval(loadTicker, 3000),
     setInterval(loadPanels, 10000),
-    // Liveness is deliberately NOT tied to the auto-refresh switch. Turning
-    // refresh off means "stop asking the market for candles", but the one thing
-    // you still need to know is whether the connection died while you were away.
+    // 存活性故意不绑在自动刷新开关上。关掉刷新 = "别再向市场要K线"，
+    // 但你依然需要知道连接是否断了。
     setInterval(loadStatus, 4000),
   ] : [
     setInterval(loadStatus, 4000),
@@ -471,656 +497,488 @@ function setupTimers() {
 }
 
 onMounted(async () => {
+  applyTheme()
   await applySymbol()
-  await Promise.all([loadSettings(), loadAuto()])
-  await loadStatus()
+  await Promise.all([loadSettings(), loadStatus()])
   setupTimers()
 })
 onBeforeUnmount(() => timers.forEach(clearInterval))
 </script>
 
 <template>
-  <div class="terminal">
-    <!-- ======================= header ======================= -->
+  <div class="app">
+    <!-- ================= 顶部栏 ================= -->
     <header class="topbar">
-      <div class="brand">OKX EMA Trader <span class="badge">模拟盘</span></div>
-      <div class="symbol-box">
+      <div class="brand">
+        <span class="brand__mark">OKX</span>
+        <span class="brand__text">EMA Trader</span>
+        <span class="tag tag--warn">模拟盘</span>
+      </div>
+
+      <div class="topbar__instrument">
         <SymbolPicker v-model="symbol" @select="applySymbol" />
-        <select v-model="bar" class="bar-select" @change="applySymbol">
+        <select v-model="bar" class="select select--bar" aria-label="K线周期" @change="applySymbol">
           <option v-for="b in BARS" :key="b" :value="b">{{ b }}</option>
         </select>
-        <button class="btn" :disabled="loading" @click="applySymbol">
-          {{ loading ? '同步中…' : '加载' }}
-        </button>
       </div>
-      <div class="ticker-strip" v-if="ticker">
-        <span class="last" :class="(changePct ?? 0) >= 0 ? 'up' : 'down'">
-          {{ fmtNum(ticker.last) }}
+
+      <!-- 当前价格：最大字号的信息，视线落点 -->
+      <div v-if="ticker" class="quote">
+        <span class="quote__last num" :class="changeTone">{{ fmtNum(ticker.last) }}</span>
+        <span class="quote__chg num" :class="changeTone">
+          {{ changePct == null ? '—' : (changePct >= 0 ? '+' : '') + changePct.toFixed(2) + '%' }}
         </span>
-        <span :class="(changePct ?? 0) >= 0 ? 'up' : 'down'">
-          {{ changePct == null ? '-' : (changePct >= 0 ? '+' : '') + changePct.toFixed(2) + '%' }}
-        </span>
-        <span class="dim">24h高 {{ fmtNum(ticker.high24h) }}</span>
-        <span class="dim">24h低 {{ fmtNum(ticker.low24h) }}</span>
-        <span class="dim">量 {{ fmtNum(ticker.vol24h, 0) }}</span>
       </div>
-      <div class="topbar-right">
-        <span class="conn-badge" v-if="status"
-              :class="connOk ? 'ok' : 'bad'"
+
+      <div class="topbar__status">
+        <!-- 三重编码：颜色 + 圆点 + 文字。仅靠颜色会让色觉障碍用户
+             把"已连接"误读成"断网"，而这个判断错误的代价很高。 -->
+        <span v-if="status" class="badge"
+              :class="connOk ? 'badge--ok' : 'badge--bad'"
               :title="connOk
                 ? `已连接 OKX，最后成功 ${lastOkText()}`
                 : `断网 ${fmtDuration(offlineFor)}｜最后成功 ${lastOkText()}｜${status.market?.last_error || status.auto?.last_error || '未知原因'}`">
-          <span class="dot"></span>
+          <span class="badge__dot"></span>
           {{ connOk ? '已连接' : '断网' + fmtDuration(offlineFor) }}
         </span>
-        <span class="conn-badge" v-if="status && riskActive"
-              :class="losingStreak > 0 ? 'warn' : 'muted'"
+
+        <span v-if="status && riskActive" class="badge"
+              :class="losingStreak > 0 ? 'badge--warn' : 'badge--idle'"
               :title="`风控：单仓浮亏 >${status.risk.limits.max_loss_pct}% 强平｜账户回撤 >${status.risk.limits.max_drawdown_pct}% 强平｜连亏 ${status.risk.limits.max_consecutive_losses} 次停手`">
-          风控 {{ losingStreak > 0 ? `连亏${losingStreak}` : '启用' }}
+          {{ riskHalted ? '风控熔断' : losingStreak > 0 ? `连亏${losingStreak}` : '风控启用' }}
         </span>
-        <button class="btn ghost" :class="{ on: autoRefresh }" @click="toggleAuto"
-                :title="autoRefresh ? '自动刷新：开' : '自动刷新：关'">
-          {{ autoRefresh ? '⟳ 自动' : '⏸ 手动' }}
+
+        <button class="btn btn--ghost btn--icon"
+                :class="{ 'is-on': autoRefresh }"
+                :title="autoRefresh ? '自动刷新：开' : '自动刷新：关'"
+                :aria-pressed="autoRefresh"
+                @click="toggleAuto">
+          {{ autoRefresh ? '⟳' : '⏸' }}
         </button>
-        <button v-if="!autoRefresh" class="btn ghost" @click="applySymbol">刷新</button>
-        <button class="btn ghost" @click="showSettings = !showSettings">⚙</button>
+        <button v-if="!autoRefresh" class="btn btn--ghost" @click="applySymbol">刷新</button>
+
+        <button class="btn btn--ghost btn--icon" :title="'切换到' + (theme === 'light' ? '深色' : '浅色') + '主题'"
+                @click="toggleTheme">
+          {{ theme === 'light' ? '☀' : '☾' }}
+        </button>
+        <button class="btn btn--ghost btn--icon" title="设置"
+                :aria-expanded="showSettings" @click="showSettings = !showSettings">⚙</button>
       </div>
     </header>
 
-    <!-- An outage must never look like a quiet market: say it out loud, with a
-         duration and a cause, for as long as it lasts. -->
-    <div v-if="status && !connOk" class="offline-banner">
-      <strong>已与 OKX 断线 {{ fmtDuration(offlineFor) }}</strong>
-      <span>最后成功连接：{{ lastOkText() }}</span>
-      <span class="dim">{{ status.market?.last_error || status.auto?.last_error || '原因未知' }}</span>
-      <span class="dim">断线期间无法获取实时价格，浮亏按开仓价估算；恢复后风控会立即重新判定。</span>
-    </div>
-    <div v-if="riskToast" class="risk-banner">{{ riskToast }}</div>
-    <div v-if="riskHalted" class="halt-banner">
-      <strong>风控已熔断：{{ riskHaltReason || '未知原因' }}</strong>
-      <span class="dim">已停止开新仓（平仓/减仓仍可用），需要人工解除。</span>
-      <button class="btn ghost" :disabled="riskBusy" @click="resetRisk">解除熔断</button>
+    <!-- 断网横幅：持续显示时长 + 原因。
+         断线不能看起来像"行情平静"——用户会据此做决策。 -->
+    <div v-if="status && !connOk" class="banner banner--danger">
+      <span class="banner__strong">已与 OKX 断线 {{ fmtDuration(offlineFor) }}</span>
+      <span class="banner__detail">最后成功连接：{{ lastOkText() }}</span>
+      <span class="banner__detail">{{ status.market?.last_error || status.auto?.last_error || '原因未知' }}</span>
+      <span class="banner__detail">断线期间浮亏按开仓价估算；恢复后风控会立即重新判定。</span>
     </div>
 
-    <div v-if="showSettings" class="settings-bar">
-      <span class="dim">代理（当前生效: {{ resolvedProxy }}）</span>
-      <input v-model="proxyInput" class="symbol-input" placeholder="留空=系统代理，如 http://127.0.0.1:6088" />
+    <!-- 熔断是唯一必须"解释而非仅展示"的状态：
+         机器人看起来活着，但就是不开仓，只有��工能解除。 -->
+    <div v-if="riskHalted" class="banner banner--danger">
+      <span class="banner__strong">风控已熔断：{{ riskHaltReason || '未知原因' }}</span>
+      <span class="banner__detail">已停止开新仓（平仓/减仓仍可用），需人工解除。</span>
+      <button class="btn btn--ghost banner__spacer" :disabled="riskBusy" @click="resetRisk">
+        {{ riskBusy ? '解除中…' : '解除熔断' }}
+      </button>
+    </div>
+
+    <div v-if="showSettings" class="banner banner--info">
+      <span class="banner__detail">代理（当前生效：{{ resolvedProxy }}）</span>
+      <input v-model="proxyInput" class="input input--proxy"
+             placeholder="留空 = 系统代理，如 http://127.0.0.1:6088" />
       <button class="btn" @click="saveProxy">保存</button>
-      <button class="btn ghost" @click="showSettings = false">收起</button>
+      <button class="btn btn--ghost banner__spacer" @click="showSettings = false">收起</button>
     </div>
 
-    <div v-if="error" class="error-banner">{{ error }}</div>
-    <div v-if="notice" class="notice-banner">{{ notice }}</div>
+    <!-- ================= 主体 ================= -->
+    <main class="layout">
+      <!-- ---------- 左栏：账户 + 权益 + 信号 ---------- -->
+      <aside class="layout__left">
+        <section v-if="account" class="panel panel--pad">
+          <h2 class="panel__title">
+            模拟账户
+            <button class="btn btn--ghost btn--mini"
+                    :class="{ 'is-on': confirmReset }"
+                    @click="doResetAccount">
+              {{ confirmReset ? '确认重置？' : '重置' }}
+            </button>
+          </h2>
 
-    <!-- ======================= body ======================= -->
-    <main class="grid">
-      <!-- left: account + 24h + signals -->
-      <aside class="col left">
-        <section class="panel account-panel" v-if="account">
-          <h3>模拟账户 <button class="mini" @click="doResetAccount" title="清空并重置为1万">重置</button></h3>
-          <div class="equity-line">
-            <b class="equity-num">{{ fmtUsdt(account.equity) }}</b>
-            <svg v-if="equityPath" viewBox="0 0 100 28" preserveAspectRatio="none" class="spark">
-              <polyline :points="equityPath" fill="none"
-                        :stroke="equityTrendUp ? '#0ecb81' : '#f6465d'" stroke-width="1.5" />
-            </svg>
+          <div class="equity-head">
+            <div class="equity-head__figure">
+              <span class="equity-head__k">总权益</span>
+              <b class="equity-head__v num">{{ fmtUsdt(account.equity) }}</b>
+              <span class="equity-head__unit">USDT</span>
+            </div>
           </div>
-          <div class="kv">
-            <div><span>可用</span><b>{{ fmtUsdt(account.available) }}</b></div>
-            <div><span>已用保证金</span><b>{{ fmtUsdt(account.margin_used) }}</b></div>
-            <div><span>未实现盈亏</span>
-              <b :class="account.unrealised_pnl >= 0 ? 'up' : 'down'">
+
+          <EquityCurve :rows="equityRows" :height="88" />
+
+          <dl class="kv kv--tight">
+            <div class="kv__row">
+              <dt class="kv__k">可用</dt>
+              <dd class="kv__v">{{ fmtUsdt(account.available) }}</dd>
+            </div>
+            <div class="kv__row">
+              <dt class="kv__k">已用保证金</dt>
+              <dd class="kv__v">{{ fmtUsdt(account.margin_used) }}</dd>
+            </div>
+            <div class="kv__row">
+              <dt class="kv__k">未实现盈亏</dt>
+              <dd class="kv__v" :class="account.unrealised_pnl >= 0 ? 'tone-up' : 'tone-down'">
                 {{ account.unrealised_pnl >= 0 ? '+' : '' }}{{ fmtUsdt(account.unrealised_pnl) }}
-              </b></div>
-            <div><span>已实现盈亏</span>
-              <b :class="account.realised_pnl >= 0 ? 'up' : 'down'">
+              </dd>
+            </div>
+            <div class="kv__row">
+              <dt class="kv__k">已实现盈亏</dt>
+              <dd class="kv__v" :class="account.realised_pnl >= 0 ? 'tone-up' : 'tone-down'">
                 {{ account.realised_pnl >= 0 ? '+' : '' }}{{ fmtUsdt(account.realised_pnl) }}
-              </b></div>
+              </dd>
+            </div>
+          </dl>
+        </section>
+
+        <!-- 24h 行情：横排而非竖排，纵向空间让给权益曲线和信号 -->
+        <section v-if="ticker" class="panel panel--pad">
+          <h2 class="panel__title">24 小时</h2>
+          <div class="ticker-grid">
+            <div class="ticker-grid__cell">
+              <span class="ticker-grid__k">买一</span>
+              <b class="num tone-up">{{ fmtNum(ticker.bid) }}</b>
+            </div>
+            <div class="ticker-grid__cell">
+              <span class="ticker-grid__k">卖一</span>
+              <b class="num tone-down">{{ fmtNum(ticker.ask) }}</b>
+            </div>
+            <div class="ticker-grid__cell">
+              <span class="ticker-grid__k">24h 开</span>
+              <b class="num">{{ fmtNum(ticker.open24h) }}</b>
+            </div>
+            <div class="ticker-grid__cell">
+              <span class="ticker-grid__k">24h 额</span>
+              <b class="num">{{ fmtNum(ticker.vol_ccy24h, 0) }}</b>
+            </div>
+            <div class="ticker-grid__cell">
+              <span class="ticker-grid__k">24h 高</span>
+              <b class="num">{{ fmtNum(ticker.high24h) }}</b>
+            </div>
+            <div class="ticker-grid__cell">
+              <span class="ticker-grid__k">24h 低</span>
+              <b class="num">{{ fmtNum(ticker.low24h) }}</b>
+            </div>
           </div>
         </section>
-        <section class="panel">
-          <h3>24小时</h3>
-          <div class="kv" v-if="ticker">
-            <div><span>买一</span><b class="up">{{ fmtNum(ticker.bid) }}</b></div>
-            <div><span>卖一</span><b class="down">{{ fmtNum(ticker.ask) }}</b></div>
-            <div><span>24h开</span><b>{{ fmtNum(ticker.open24h) }}</b></div>
-            <div><span>24h额</span><b>{{ fmtNum(ticker.vol_ccy24h, 0) }}</b></div>
-          </div>
-          <div class="dim" v-else>等待行情…</div>
-        </section>
-        <section class="panel grow">
-          <h3>看多/看空记录 <span class="dim">({{ signalLog.length }})</span></h3>
-          <div class="scroll">
-            <div v-for="s in signalLog" :key="s.id" class="row sig-row">
-              <span class="dim">{{ fmtTime(s.ts) }}</span>
-              <b :class="s.side === 'short' ? 'down' : 'up'">
-                {{ s.side === 'short' ? '看空' : (s.side === 'long' ? '看多' : '—') }}
-              </b>
-              <span class="sig-inst">{{ shortInst(s.inst_id) }}</span>
-              <span>{{ fmtNum(s.price) }}</span>
-              <span class="dim">ADX {{ s.adx != null ? Number(s.adx).toFixed(1) : '—' }}</span>
-              <span :class="['sig-tag', s.acted ? 'ok' : 'no']">
-                {{ s.acted ? '已下单' : '未成交' }}
-              </span>
-              <span class="dim reason">{{ s.reason }}</span>
-            </div>
-            <div v-if="!signalLog.length" class="dim">
-              暂无记录 —— 自动交易每根 5m 收盘评估一次，有信号才会写入这里。
-            </div>
+
+        <section class="panel panel--fill">
+          <h2 class="panel__title">
+            信号记录
+            <span class="panel__count">{{ signalLog.length }}</span>
+          </h2>
+          <div class="scroll panel__body">
+            <SignalFeed :signals="signalLog" />
           </div>
         </section>
       </aside>
 
-      <!-- center: chart -->
-      <section class="col center">
-        <div class="chart-box">
+      <!-- ---------- 中栏：图表 ---------- -->
+      <section class="layout__center">
+        <div class="chart-card">
           <KlineChart :rows="rows" :markers="markers" :ema-fast="20" :ema-slow="50" />
         </div>
         <div class="statusline">
-          <span :class="syncing ? 'warn' : 'dim'">
-            {{ syncing ? '⟳ 正在从 OKX 补拉缺口…' : `本地K线 ${rows.length} 根 · 服务端每5s刷新` }}
+          <span class="statusline__item">
+            <span :class="syncing ? 'tone-accent' : 'tone-dim'">
+              {{ syncing ? '⟳ 正在从 OKX 补拉缺口…' : `本地 K 线 ${rows.length} 根` }}
+            </span>
           </span>
-          <span class="dim" v-if="stats">
-            数据库 {{ (stats.size_bytes / 1048576).toFixed(1) }} MB ·
+          <span v-if="stats" class="statusline__item tone-dim num">
+            库 {{ (stats.size_bytes / 1048576).toFixed(1) }} MB ·
             K线 {{ stats.counts.candles }} · 订单 {{ stats.counts.orders }} · 信号 {{ stats.counts.signals }}
           </span>
+          <span class="statusline__item tone-dim num">更新 {{ fmtClock(lastUpdate) }}</span>
         </div>
       </section>
 
-      <!-- right: trade / backtest tabs -->
-      <aside class="col right">
-        <div class="tabs">
-          <button :class="{ active: rightTab === 'trade' }" @click="rightTab = 'trade'">交易</button>
-          <button :class="{ active: rightTab === 'backtest' }" @click="rightTab = 'backtest'">回测</button>
-          <button :class="{ active: rightTab === 'history' }" @click="rightTab = 'history'">历史</button>
+      <!-- ---------- 右栏：工作台（标签页隔离任务） ---------- -->
+      <aside class="layout__right">
+        <div class="tabs worktabs" role="tablist">
+          <button v-for="t in TABS" :key="t.key"
+                  class="tabs__btn"
+                  :class="{ 'is-active': workTab === t.key }"
+                  role="tab"
+                  :aria-selected="workTab === t.key"
+                  @click="workTab = t.key">{{ t.label }}</button>
         </div>
 
-        <!-- ============ trade tab ============ -->
-        <template v-if="rightTab === 'trade'">
-          <section class="panel auto-panel" :class="{ live: auto?.enabled }">
+        <!-- ===== 交易 ===== -->
+        <template v-if="workTab === 'trade'">
+          <section class="panel panel--pad">
+            <TradeTicket
+              v-model:side="tradeSide"
+              v-model:notional="tradeNotional"
+              v-model:leverage="tradeLeverage"
+              :ref-price="refPrice"
+              :available="account?.available || 0"
+              :busy="trading"
+              @submit="openTrade"
+              @set-pct="setNotionalPct" />
+          </section>
+
+          <section class="panel panel--fill">
+            <h2 class="panel__title">
+              持仓
+              <span class="panel__count">{{ account?.positions?.length || 0 }}</span>
+            </h2>
+            <div class="scroll panel__body pos-list">
+              <PositionCard
+                v-for="p in account?.positions || []"
+                :key="p.id"
+                :position="p"
+                :busy="closingId === p.id"
+                @close="closeTrade" />
+              <div v-if="!(account?.positions?.length)" class="empty">
+                <span class="empty__icon">◇</span>
+                <span>当前无持仓</span>
+                <span>用上方交易台手动开仓，或在「自动」标签页启动策略</span>
+              </div>
+            </div>
+          </section>
+        </template>
+
+        <!-- ===== 自动 ===== -->
+        <template v-else-if="workTab === 'auto'">
+          <section class="panel panel--pad" :class="{ 'panel--live': auto?.enabled }">
             <div class="auto-head">
-              <h3>自动交易 <span class="badge" v-if="auto?.enabled">运行中</span></h3>
-              <button class="btn auto-toggle" :class="{ on: auto?.enabled }"
+              <h2 class="panel__title">
+                自动交易
+                <span v-if="auto?.enabled" class="badge badge--ok badge--pulse">
+                  <span class="badge__dot"></span>运行中
+                </span>
+                <span v-else class="badge badge--idle">已停止</span>
+              </h2>
+              <button class="btn"
+                      :class="auto?.enabled ? 'btn--danger' : 'btn--primary'"
                       :disabled="autoBusy" @click="toggleAutoTrade">
                 {{ auto?.enabled ? '停止' : '启动' }}
               </button>
             </div>
-            <div class="auto-meta dim">
-              策略：15m 趋势 + ADX&gt;20 + 5m EMA20/50 交叉 · 每根 5m 收盘评估 ·
-              无信号不操作
-            </div>
 
-            <div class="auto-meta">监控币种</div>
-            <div class="watch-list">
-              <span v-for="inst in (auto?.symbols || [])" :key="inst" class="watch-chip">
-                <b>{{ shortInst(inst) }}</b>
-                <button :disabled="autoBusy" @click="removeAutoSymbol(inst)"
-                        :title="`从监控列表移除 ${inst}`">×</button>
-              </span>
-              <span v-if="!(auto?.symbols || []).length" class="dim">（未选择，请添加）</span>
-            </div>
-            <div class="watch-add">
-              <input v-model="autoSymbolInput" class="symbol-input"
-                     placeholder="如 BTC / ETH-USDT-SWAP"
-                     @keyup.enter="addAutoSymbol(autoSymbolInput)" />
-              <button class="btn" :disabled="autoBusy"
-                      @click="addAutoSymbol(autoSymbolInput)">添加</button>
-              <button class="btn" :disabled="autoBusy"
-                      @click="addAutoSymbol(symbol)">加当前</button>
+            <p class="auto-desc">
+              15m 趋势 + ADX&gt;20 + 5m EMA20/50 交叉 · 每根 5m 收盘评估 · 无信号不操作
+            </p>
+
+            <div class="field">
+              <span class="field__label">监控币种 <span class="tone-dim">共 {{ auto?.symbols?.length || 0 }}</span></span>
+              <div class="token-row">
+                <span v-for="inst in (auto?.symbols || [])" :key="inst" class="token">
+                  {{ shortInst(inst) }}
+                  <button class="token__x" :disabled="autoBusy"
+                          :title="`从监控列表移除 ${inst}`"
+                          :aria-label="`移除 ${inst}`"
+                          @click="removeAutoSymbol(inst)">×</button>
+                </span>
+                <span v-if="!(auto?.symbols || []).length" class="tone-dim auto-hint">
+                  （未选择，请从下方添加）
+                </span>
+              </div>
+              <div class="token-add">
+                <input v-model="autoSymbolInput" class="input"
+                       placeholder="如 BTC / ETH-USDT-SWAP"
+                       @keyup.enter="addAutoSymbol(autoSymbolInput)" />
+                <button class="btn" :disabled="autoBusy" @click="addAutoSymbol(autoSymbolInput)">添加</button>
+                <button class="btn btn--ghost" :disabled="autoBusy" @click="addAutoSymbol(symbol)">加当前</button>
+              </div>
             </div>
 
             <div class="auto-params">
-              <label>每笔 USDT
-                <input type="number" v-model.number="autoNotional" min="1" step="10"
-                       @change="saveAutoParams" />
+              <label class="field">
+                <span class="field__label">每笔 USDT</span>
+                <input v-model.number="autoNotional" class="input input--num"
+                       type="number" min="1" step="10" @change="saveAutoParams" />
               </label>
-              <label>杠杆
-                <input type="number" v-model.number="autoLeverage" min="1" max="20"
-                       @change="saveAutoParams" />
+              <label class="field">
+                <span class="field__label">杠杆</span>
+                <input v-model.number="autoLeverage" class="input input--num"
+                       type="number" min="1" max="20" @change="saveAutoParams" />
               </label>
-              <label>最大持仓
-                <input type="number" v-model.number="autoMaxPositions" min="1" max="10"
-                       @change="saveAutoParams" />
+              <label class="field">
+                <span class="field__label">最大持仓</span>
+                <input v-model.number="autoMaxPositions" class="input input--num"
+                       type="number" min="1" max="10" @change="saveAutoParams" />
               </label>
             </div>
 
-            <div class="scan-table" v-if="(auto?.symbols || []).length">
-              <div v-for="inst in auto.symbols" :key="inst" class="scan-row">
-                <span>{{ shortInst(inst) }}</span>
-                <span :class="['hit', scanOf(inst)?.side === 'short' ? 'down' : 'up']">
-                  {{ scanOf(inst)?.side === 'short' ? '看空'
-                     : (scanOf(inst)?.side === 'long' ? '看多' : '—') }}
-                </span>
-                <span class="why" :title="scanOf(inst)?.why || ''">
-                  {{ scanOf(inst)?.why || '尚未评估' }}
-                </span>
-              </div>
+            <div v-if="auto?.last_action" class="auto-note">
+              最近动作：{{ auto.last_action }}
             </div>
+            <div v-if="auto?.last_error" class="auto-note auto-note--bad">
+              最近错误：{{ auto.last_error }}
+            </div>
+          </section>
 
-            <div v-if="auto?.last_action" class="auto-meta">最近动作：{{ auto.last_action }}</div>
-            <div v-if="auto?.last_error" class="auto-err">最近错误：{{ auto.last_error }}</div>
-          </section>
-          <section class="panel">
-            <div class="side-pick">
-              <button class="side-btn long" :class="{ active: tradeSide === 'long' }"
-                      @click="tradeSide = 'long'">开多</button>
-              <button class="side-btn short" :class="{ active: tradeSide === 'short' }"
-                      @click="tradeSide = 'short'">开空</button>
-            </div>
-            <div class="ref-price" v-if="refPrice">
-              <span class="dim">市价成交参考</span>
-              <b :class="tradeSide === 'long' ? 'up' : 'down'">{{ fmtNum(refPrice) }}</b>
-              <span class="dim">（{{ tradeSide === 'long' ? '卖一' : '买一' }}）</span>
-            </div>
-            <div class="ticket">
-              <label>名义价值 USDT
-                <input type="number" v-model.number="tradeNotional" min="1" step="10" />
-              </label>
-              <div class="chips">
-                <button v-for="n in [100, 500, 1000, 5000]" :key="n" class="chip"
-                        :class="{ on: tradeNotional === n }"
-                        @click="tradeNotional = n">{{ n }}</button>
-              </div>
-              <div class="chips" v-if="account">
-                <button v-for="p in [10, 25, 50, 100]" :key="p" class="chip"
-                        title="按可用余额的百分比 × 当前杠杆"
-                        @click="setNotionalPct(p / 100)">{{ p }}%</button>
-                <span class="dim chips-note">可用 {{ fmtUsdt(account.available) }}</span>
-              </div>
-              <label>杠杆 <b class="accent-text">{{ tradeLeverage }}x</b>
-                <input type="range" v-model.number="tradeLeverage" min="1" max="20" class="slider" />
-              </label>
-              <div class="ticket-meta dim">
-                保证金 ≈ {{ (tradeNotional / tradeLeverage).toFixed(2) }} ·
-                手续费 ≈ {{ (tradeNotional * 0.0005).toFixed(2) }}
-                <template v-if="ticker"> · 预估强平
-                  {{ tradeSide === 'long'
-                     ? fmtNum((ticker.ask || 0) * (1 - 1 / tradeLeverage))
-                     : fmtNum((ticker.bid || 0) * (1 + 1 / tradeLeverage)) }}
-                </template>
-              </div>
-              <button class="btn submit" :class="tradeSide" :disabled="trading" @click="openTrade">
-                {{ trading ? '下单中…' : (tradeSide === 'long' ? '买入开多' : '卖出开空') }}
-              </button>
-            </div>
-          </section>
-          <section class="panel grow">
-            <h3>持仓 <span class="dim">({{ account?.positions?.length || 0 }})</span></h3>
-            <div class="scroll">
-              <div v-for="p in account?.positions || []" :key="p.id" class="pos-card">
-                <div class="pos-head">
-                  <b :class="p.side === 'short' ? 'down' : 'up'">
-                    {{ p.side === 'short' ? '空' : '多' }} {{ p.inst_id }}
-                  </b>
-                  <span class="dim">{{ p.leverage }}x</span>
-                  <b :class="p.unrealised_pnl >= 0 ? 'up' : 'down'">
-                    {{ p.unrealised_pnl >= 0 ? '+' : '' }}{{ fmtUsdt(p.unrealised_pnl) }}
-                  </b>
+          <section v-if="(auto?.symbols || []).length" class="panel panel--fill">
+            <h2 class="panel__title">扫描结果</h2>
+            <div class="scroll panel__body">
+              <div class="scan">
+                <div v-for="inst in auto.symbols" :key="inst" class="scan__row">
+                  <b class="scan__inst">{{ shortInst(inst) }}</b>
+                  <span class="scan__hit"
+                        :class="scanOf(inst)?.side === 'short' ? 'tone-down'
+                               : scanOf(inst)?.side === 'long' ? 'tone-up' : 'tone-dim'">
+                    {{ scanOf(inst)?.side === 'short' ? '看空'
+                       : scanOf(inst)?.side === 'long' ? '看多' : '—' }}
+                  </span>
+                  <span class="scan__why">{{ scanOf(inst)?.why || '尚未评估' }}</span>
                 </div>
-                <div class="pos-meta dim">
-                  开仓 {{ fmtNum(p.entry_price) }} · 标记 {{ fmtNum(p.mark_price) }} ·
-                  强平 ≈ {{ fmtNum(p.liq_price) }}
-                </div>
-                <div class="pos-meta dim">
-                  名义 {{ fmtUsdt(p.notional) }} · 保证金 {{ fmtUsdt(p.margin) }} · {{ fmtTime(p.opened_at) }}
-                </div>
-                <button class="btn close-btn" :disabled="closingId === p.id" @click="closeTrade(p)">
-                  {{ closingId === p.id ? '平仓中…' : '市价平仓' }}
-                </button>
               </div>
-              <div v-if="!(account?.positions?.length)" class="dim">暂无持仓</div>
             </div>
           </section>
         </template>
 
-        <!-- ============ backtest tab ============ -->
-        <template v-if="rightTab === 'backtest'">
-          <section class="panel">
-            <div class="bt-form">
-              <label>天数 <input type="number" v-model.number="btDays" min="1" max="365" /></label>
-              <label>费率 <input type="number" v-model.number="btFee" min="0" step="0.5" /> bps</label>
-              <label>滑点 <input type="number" v-model.number="btSlip" min="0" step="0.5" /> bps</label>
-              <button class="btn accent" :disabled="btRunning" @click="runBacktest">
-                {{ btRunning ? '回测中…' : '运行回测' }}
-              </button>
+        <!-- ===== 回测 ===== -->
+        <template v-else-if="workTab === 'backtest'">
+          <section class="panel panel--pad">
+            <h2 class="panel__title">参数</h2>
+            <div class="bt-params">
+              <label class="field">
+                <span class="field__label">天数</span>
+                <input v-model.number="btDays" class="input input--num" type="number" min="1" max="365" />
+              </label>
+              <label class="field">
+                <span class="field__label">费率 bps</span>
+                <input v-model.number="btFee" class="input input--num" type="number" min="0" step="0.5" />
+              </label>
+              <label class="field">
+                <span class="field__label">滑点 bps</span>
+                <input v-model.number="btSlip" class="input input--num" type="number" min="0" step="0.5" />
+              </label>
             </div>
-            <div v-if="btResult" class="bt-result">
-              <div><span>净收益</span>
-                <b :class="btResult.net_return > 0 ? 'up' : 'down'">{{ fmtPct(btResult.net_return) }}</b></div>
-              <div><span>交易</span><b>{{ btResult.trades }} 笔 · 胜率 {{ fmtPct(btResult.win_rate) }}</b></div>
-              <div><span>回撤(账户)</span><b class="down">{{ fmtPct(btResult.max_drawdown_account) }}</b></div>
-              <div><span>保本成本</span><b>{{ btResult.breakeven_bps?.toFixed(1) }} bps</b></div>
-              <div :class="btResult.net_return > 0 ? 'up' : 'down'" class="verdict">
-                {{ btResult.verdict }}
-              </div>
-            </div>
+            <button class="btn btn--primary btn--block btn--lg" :disabled="btRunning" @click="runBacktest">
+              {{ btRunning ? '回测中…' : '运行回测' }}
+            </button>
           </section>
-          <section class="panel grow">
-            <h3>历史回测</h3>
-            <div class="scroll">
-              <div v-for="b in backtests" :key="b.id" class="row">
-                <span class="dim">{{ fmtTime(b.created_at) }}</span>
-                <span>{{ b.days }}d</span>
-                <b :class="b.result.net_return > 0 ? 'up' : 'down'">{{ fmtPct(b.result.net_return) }}</b>
+
+          <section v-if="btResult" class="panel panel--pad">
+            <h2 class="panel__title">
+              本次结果
+              <span class="tag" :class="btResult.net_return > 0 ? 'tag--up' : 'tag--down'">
+                {{ btResult.net_return > 0 ? '正收益' : '负收益' }}
+              </span>
+            </h2>
+            <dl class="kv">
+              <div class="kv__row">
+                <dt class="kv__k">净收益</dt>
+                <dd class="kv__v" :class="btResult.net_return > 0 ? 'tone-up' : 'tone-down'">
+                  {{ fmtPct(btResult.net_return) }}
+                </dd>
               </div>
-              <div v-if="!backtests.length" class="dim">暂无回测记录</div>
+              <div class="kv__row">
+                <dt class="kv__k">交易数 / 胜率</dt>
+                <dd class="kv__v">{{ btResult.trades }} 笔 · {{ fmtPct(btResult.win_rate) }}</dd>
+              </div>
+              <div class="kv__row">
+                <dt class="kv__k">账户最大回撤</dt>
+                <dd class="kv__v tone-down">{{ fmtPct(btResult.max_drawdown_account) }}</dd>
+              </div>
+              <div class="kv__row">
+                <dt class="kv__k">保本成本</dt>
+                <dd class="kv__v">{{ btResult.breakeven_bps?.toFixed(1) }} bps</dd>
+              </div>
+            </dl>
+            <p class="verdict" :class="btResult.net_return > 0 ? 'tone-up' : 'tone-down'">
+              {{ btResult.verdict }}
+            </p>
+          </section>
+
+          <section class="panel panel--fill">
+            <h2 class="panel__title">
+              历史回测
+              <span class="panel__count">{{ backtests.length }}</span>
+            </h2>
+            <div class="scroll panel__body">
+              <div v-for="b in backtests" :key="b.id" class="bt-row">
+                <span class="num tone-dim">{{ fmtTime(b.created_at) }}</span>
+                <span class="bt-row__days num">{{ b.days }}d</span>
+                <b class="num" :class="b.result.net_return > 0 ? 'tone-up' : 'tone-down'">
+                  {{ fmtPct(b.result.net_return) }}
+                </b>
+              </div>
+              <div v-if="!backtests.length" class="empty">
+                <span class="empty__icon">◷</span>
+                <span>暂无回测记录</span>
+              </div>
             </div>
           </section>
         </template>
 
-        <!-- ============ history tab ============ -->
-        <template v-if="rightTab === 'history'">
-          <section class="panel grow">
-            <h3>订单记录 <span class="dim">({{ historyOrders.length }})</span></h3>
-            <div class="hist-filters">
-              <select v-model="ordStatus" class="bar-select" @change="loadOrders">
+        <!-- ===== 历史 ===== -->
+        <template v-else>
+          <section class="panel panel--fill">
+            <h2 class="panel__title">
+              订单记录
+              <span class="panel__count">{{ historyOrders.length }}</span>
+            </h2>
+
+            <div class="filters">
+              <select v-model="ordStatus" class="select" aria-label="订单状态" @change="loadOrders">
                 <option value="">全部状态</option>
                 <option value="open">持仓中</option>
                 <option value="closed">已平仓</option>
               </select>
-              <label class="chk dim">
+              <label class="check">
                 <input type="checkbox" v-model="ordOnlyCurrent" @change="loadOrders" />
                 仅当前币种
               </label>
-              <button class="btn ghost mini-refresh" @click="loadOrders">刷新</button>
             </div>
-            <div class="hist-summary" v-if="orderSummary.closed">
-              <span>已平 {{ orderSummary.closed }} 笔</span>
-              <span>胜率 {{ orderSummary.winRate == null ? '-' : (orderSummary.winRate * 100).toFixed(0) + '%' }}</span>
+
+            <div v-if="orderSummary.closed" class="filters__summary">
+              <span>已平 <b class="num">{{ orderSummary.closed }}</b> 笔</span>
+              <span>胜率 <b class="num">{{ orderSummary.winRate == null ? '—' : (orderSummary.winRate * 100).toFixed(0) + '%' }}</b></span>
               <span>合计
-                <b :class="orderSummary.total >= 0 ? 'up' : 'down'">
+                <b class="num" :class="orderSummary.total >= 0 ? 'tone-up' : 'tone-down'">
                   {{ orderSummary.total >= 0 ? '+' : '' }}{{ fmtUsdt(orderSummary.total) }}
                 </b>
               </span>
             </div>
-            <div class="scroll">
-              <div v-for="o in historyOrders" :key="o.id" class="order-card">
-                <div class="or-line1">
-                  <b :class="o.side === 'short' ? 'down' : 'up'">
+
+            <div class="scroll panel__body">
+              <article v-for="o in historyOrders" :key="o.id" class="ord">
+                <div class="ord__row">
+                  <span class="tag" :class="o.side === 'short' ? 'tag--down' : 'tag--up'">
                     {{ o.side === 'short' ? '空' : '多' }}
-                  </b>
-                  <span>{{ o.inst_id.replace('-USDT-SWAP', '') }}</span>
-                  <span class="dim">{{ o.leverage }}x</span>
-                  <span class="dim or-time">{{ fmtTime(o.opened_at) }}</span>
-                  <b v-if="o.pnl != null" :class="o.pnl >= 0 ? 'up' : 'down'">
+                  </span>
+                  <b class="ord__inst">{{ o.inst_id.replace('-USDT-SWAP', '') }}</b>
+                  <span class="ord__lev num">{{ o.leverage }}x</span>
+                  <b v-if="o.pnl != null" class="num ord__pnl" :class="o.pnl >= 0 ? 'tone-up' : 'tone-down'">
                     {{ o.pnl >= 0 ? '+' : '' }}{{ fmtUsdt(o.pnl) }}
-                    <span class="dim">({{ o.pnl_pct == null ? '-' : (o.pnl_pct * 100).toFixed(1) + '%' }})</span>
+                    <small v-if="o.pnl_pct != null">({{ (o.pnl_pct * 100).toFixed(1) }}%)</small>
                   </b>
-                  <span v-else class="warn">持仓中</span>
+                  <span v-else class="tag tag--warn">持仓中</span>
                 </div>
-                <div class="or-line2 dim">
+                <div class="ord__row ord__row--sub num tone-dim">
                   {{ fmtNum(o.entry_price) }} → {{ o.exit_price ? fmtNum(o.exit_price) : '…' }}
                   · 名义 {{ fmtUsdt(o.notional) }}
-                  <template v-if="o.closed_at"> · 平仓 {{ fmtTime(o.closed_at) }}</template>
+                  <span class="ord__time">{{ fmtTime(o.opened_at) }}</span>
                 </div>
+              </article>
+              <div v-if="!historyOrders.length" class="empty">
+                <span class="empty__icon">☰</span>
+                <span>暂无符合条件的订单</span>
               </div>
-              <div v-if="!historyOrders.length" class="dim">暂无符合条件的订单</div>
             </div>
           </section>
         </template>
       </aside>
     </main>
+
+    <!-- Toast：瞬时反馈不改变布局 -->
+    <div class="toast-stack" role="status" aria-live="polite">
+      <div v-for="t in toasts" :key="t.id" class="toast" :class="'toast--' + t.kind">
+        {{ t.msg }}
+      </div>
+    </div>
   </div>
 </template>
-
-<style>
-:root {
-  --bg: #0b0e11;
-  --panel: #161a1e;
-  --border: #2b3139;
-  --text: #eaecef;
-  --dim: #848e9c;
-  --up: #0ecb81;
-  --down: #f6465d;
-  --warn: #f0b90b;
-  --accent: #f0b90b;
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0; background: var(--bg); color: var(--text);
-  font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-}
-.up { color: var(--up); }
-.down { color: var(--down); }
-.dim { color: var(--dim); font-weight: normal; }
-.warn { color: var(--accent); }
-.accent-text { color: var(--accent); }
-
-.terminal { display: flex; flex-direction: column; height: 100vh; }
-.topbar {
-  display: flex; align-items: center; gap: 18px; padding: 0 14px;
-  height: 52px; background: var(--panel); border-bottom: 1px solid var(--border);
-}
-.brand { font-weight: 700; font-size: 15px; color: var(--accent); white-space: nowrap; }
-.badge {
-  font-size: 10px; background: var(--accent); color: #0b0e11;
-  border-radius: 3px; padding: 1px 5px; vertical-align: 2px;
-}
-.symbol-box { display: flex; gap: 6px; }
-.symbol-input, .bar-select, .bt-form input, .ticket input[type=number], .settings-bar input {
-  background: var(--bg); border: 1px solid var(--border); color: var(--text);
-  padding: 6px 8px; border-radius: 4px; width: 170px; outline: none;
-}
-.bar-select { width: 70px; }
-.btn {
-  background: var(--border); border: none; color: var(--text);
-  padding: 6px 14px; border-radius: 4px; cursor: pointer;
-}
-.btn:hover { background: #3a424c; }
-.btn:disabled { opacity: 0.5; cursor: default; }
-.btn.accent { background: var(--accent); color: #0b0e11; font-weight: 600; }
-.btn.ghost { background: transparent; border: 1px solid var(--border); padding: 4px 10px; }
-.btn.ghost.on { border-color: var(--accent); color: var(--accent); }
-.btn.mini, button.mini {
-  background: transparent; border: 1px solid var(--border); color: var(--dim);
-  font-size: 10px; border-radius: 3px; padding: 1px 6px; cursor: pointer; margin-left: 6px;
-}
-.ticker-strip { display: flex; gap: 14px; align-items: baseline; }
-.ticker-strip .last { font-size: 18px; font-weight: 700; }
-.topbar-right { margin-left: auto; display: flex; gap: 6px; }
-
-.settings-bar {
-  display: flex; gap: 8px; align-items: center; padding: 6px 14px;
-  background: var(--panel); border-bottom: 1px solid var(--border);
-}
-.settings-bar input { flex: 1; max-width: 420px; }
-
-.error-banner {
-  background: rgba(246, 70, 93, 0.15); color: var(--down);
-  padding: 6px 14px; border-bottom: 1px solid var(--border);
-}
-.notice-banner {
-  background: rgba(14, 203, 129, 0.12); color: var(--up);
-  padding: 6px 14px; border-bottom: 1px solid var(--border);
-}
-
-/* Liveness badge. Colour alone would not do: a red dot and a green dot are the
-   same shape, so the label carries the state and the dot only reinforces it. */
-.conn-badge {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 3px 8px; border-radius: 3px; font-size: 12px;
-  border: 1px solid var(--border); color: var(--dim);
-  white-space: nowrap; cursor: default;
-}
-.conn-badge .dot {
-  width: 6px; height: 6px; border-radius: 50%; background: currentColor;
-  flex: 0 0 auto;
-}
-.conn-badge.ok { color: var(--up); border-color: rgba(14, 203, 129, 0.4); }
-.conn-badge.bad {
-  color: var(--down); border-color: var(--down);
-  background: rgba(246, 70, 93, 0.12);
-}
-/* A losing streak is not a failure state — it is a caution. */
-.conn-badge.warn { color: var(--warn); border-color: rgba(240, 185, 11, 0.5); }
-.conn-badge.muted { color: var(--dim); }
-
-.offline-banner {
-  display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
-  background: rgba(246, 70, 93, 0.15); color: var(--down);
-  padding: 7px 14px; border-bottom: 1px solid var(--border);
-}
-.offline-banner strong { font-weight: 600; }
-.offline-banner .dim { color: var(--dim); font-size: 12px; }
-
-.risk-banner {
-  background: rgba(240, 185, 11, 0.14); color: var(--warn);
-  padding: 6px 14px; border-bottom: 1px solid var(--border);
-}
-.halt-banner {
-  display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
-  background: rgba(246, 70, 93, 0.15); color: var(--down);
-  padding: 7px 14px; border-bottom: 1px solid var(--border);
-}
-.halt-banner strong { font-weight: 600; }
-.halt-banner .dim { color: var(--dim); font-size: 12px; }
-
-.grid {
-  flex: 1; display: grid; gap: 4px; padding: 4px;
-  grid-template-columns: 250px 1fr 300px; min-height: 0;
-}
-.col { display: flex; flex-direction: column; gap: 4px; min-height: 0; }
-.panel {
-  background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
-  padding: 10px 12px; display: flex; flex-direction: column; min-height: 0;
-}
-.panel.grow { flex: 1; }
-.panel h3 { margin: 0 0 8px; font-size: 12px; color: var(--dim); text-transform: uppercase; }
-.kv div, .bt-result div { display: flex; justify-content: space-between; padding: 2px 0; }
-.kv span, .bt-result span { color: var(--dim); }
-.scroll { overflow-y: auto; min-height: 0; flex: 1; }
-.row {
-  display: flex; gap: 8px; align-items: baseline; padding: 3px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.04); white-space: nowrap;
-}
-.reason { overflow: hidden; text-overflow: ellipsis; }
-
-.account-panel .equity-line { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
-.equity-num { font-size: 20px; }
-.spark { flex: 1; height: 28px; }
-
-.center { min-width: 0; }
-.chart-box {
-  flex: 1; background: var(--panel); border: 1px solid var(--border);
-  border-radius: 4px; overflow: hidden; min-height: 0;
-}
-.statusline {
-  display: flex; justify-content: space-between; padding: 4px 8px;
-  background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
-}
-
-.tabs { display: flex; gap: 4px; }
-.tabs button {
-  flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--dim);
-  padding: 7px 0; border-radius: 4px; cursor: pointer; font-size: 13px;
-}
-.tabs button.active { color: var(--accent); border-color: var(--accent); }
-
-.side-pick { display: flex; gap: 6px; margin-bottom: 10px; }
-.side-btn {
-  flex: 1; padding: 8px 0; border-radius: 4px; cursor: pointer; font-weight: 600;
-  background: var(--bg); border: 1px solid var(--border); color: var(--dim);
-}
-.side-btn.long.active { background: rgba(14,203,129,0.15); color: var(--up); border-color: var(--up); }
-.side-btn.short.active { background: rgba(246,70,93,0.15); color: var(--down); border-color: var(--down); }
-.ticket label { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; color: var(--dim); }
-.ticket input[type=number] { width: 100%; }
-.slider { width: 100%; accent-color: var(--accent); }
-.ticket-meta { font-size: 11px; margin-bottom: 10px; }
-.btn.submit { width: 100%; padding: 10px 0; font-weight: 700; font-size: 14px; }
-.btn.submit.long { background: var(--up); color: #0b0e11; }
-.btn.submit.short { background: var(--down); color: #fff; }
-
-.pos-card {
-  border: 1px solid var(--border); border-radius: 4px; padding: 8px;
-  margin-bottom: 8px; background: var(--bg);
-}
-.pos-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 4px; }
-.pos-head b:last-child { margin-left: auto; }
-.pos-meta { font-size: 11px; }
-.close-btn { width: 100%; margin-top: 6px; padding: 5px 0; }
-
-.bt-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 6px; }
-.bt-form input { width: 52px; }
-.bt-result .verdict { margin-top: 6px; font-weight: 600; }
-
-.auto-panel { border-color: var(--border); }
-.auto-panel.live { border-color: var(--accent); }
-.auto-head { display: flex; justify-content: space-between; align-items: center; }
-.auto-head h3 { margin: 0; }
-.auto-toggle.on { background: var(--down); color: #fff; }
-.auto-toggle:not(.on) { background: var(--up); color: #0b0e11; font-weight: 600; }
-.auto-meta { font-size: 11px; margin-top: 6px; }
-.auto-err { font-size: 11px; margin-top: 6px; color: var(--down); }
-.auto-params { display: flex; gap: 8px; margin-top: 8px; }
-.watch-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
-.watch-chip {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 2px 6px; border-radius: 10px; font-size: 11px;
-  background: var(--bg-soft); border: 1px solid var(--border);
-}
-.watch-chip b { font-weight: 600; }
-.watch-chip button {
-  border: 0; background: transparent; cursor: pointer;
-  color: var(--dim); font-size: 12px; line-height: 1; padding: 0 1px;
-}
-.watch-chip button:hover { color: var(--down); }
-.watch-add { display: flex; gap: 5px; margin-top: 6px; }
-.watch-add input { flex: 1; min-width: 0; font-size: 11px; }
-.scan-table { margin-top: 8px; font-size: 11px; }
-.scan-row {
-  display: grid; grid-template-columns: 52px 34px 1fr;
-  gap: 6px; padding: 2px 0; align-items: baseline;
-  border-top: 1px solid var(--border);
-}
-.scan-row:first-child { border-top: 0; }
-.scan-row .why { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.scan-row .hit { font-weight: 700; }
-.sig-row { display: flex; gap: 6px; align-items: baseline; flex-wrap: nowrap; }
-.sig-inst { min-width: 38px; font-weight: 600; }
-.sig-row .reason { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sig-tag { font-size: 10px; padding: 0 4px; border-radius: 6px; white-space: nowrap; }
-.sig-tag.ok { background: rgba(14, 203, 129, .14); color: var(--up); }
-.sig-tag.no { background: rgba(246, 70, 93, .12); color: var(--down); }
-.auto-params label { display: flex; flex-direction: column; gap: 3px; color: var(--dim); font-size: 11px; }
-.auto-params input {
-  background: var(--bg); border: 1px solid var(--border); color: var(--text);
-  padding: 5px 8px; border-radius: 4px; width: 90px; outline: none;
-}
-
-/* --- trade ticket extras ------------------------------------------------- */
-.ref-price {
-  display: flex; align-items: baseline; gap: 6px; margin-bottom: 8px;
-  padding: 5px 8px; background: var(--bg); border: 1px solid var(--border);
-  border-radius: 4px; font-size: 12px;
-}
-.ref-price b { font-size: 14px; }
-.chips { display: flex; gap: 4px; align-items: center; margin: -4px 0 8px; }
-.chip {
-  background: var(--bg); border: 1px solid var(--border); color: var(--dim);
-  font-size: 11px; border-radius: 3px; padding: 2px 8px; cursor: pointer;
-}
-.chip:hover { color: var(--text); border-color: #3a424c; }
-.chip.on { color: var(--accent); border-color: var(--accent); }
-.chips-note { font-size: 11px; margin-left: auto; }
-
-/* --- order history -------------------------------------------------------- */
-.hist-filters {
-  display: flex; gap: 8px; align-items: center; margin-bottom: 8px;
-}
-.hist-filters .bar-select { width: 92px; }
-.chk { display: flex; gap: 4px; align-items: center; font-size: 12px; cursor: pointer; }
-.mini-refresh { margin-left: auto; font-size: 11px; }
-.hist-summary {
-  display: flex; gap: 14px; font-size: 12px; color: var(--dim);
-  padding: 5px 8px; margin-bottom: 8px;
-  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
-}
-.order-card {
-  border: 1px solid var(--border); border-radius: 4px;
-  padding: 6px 8px; margin-bottom: 6px; background: var(--bg);
-}
-.or-line1 { display: flex; gap: 8px; align-items: baseline; }
-.or-line1 .or-time { margin-left: auto; font-size: 11px; }
-.or-line2 { font-size: 11px; margin-top: 2px; }
-</style>

@@ -1,0 +1,264 @@
+/* ==========================================================================
+   OKX EMA Trader — 设计令牌层
+   --------------------------------------------------------------------------
+   所有组件只允许消费这里的变量，不允许硬编码色值/字号/间距。
+   原因：这套界面有 5 个功能域（账户、行情、交易、回测、信号）共 20+ 组件，
+   硬编码过一次就意味着"改一处要翻十个文件"。令牌是唯一的真相来源。
+
+   色彩策略（重要，先读这段）：
+   本项目是 OKX 永续合约交易终端，采用加密行业惯例 **绿涨红跌**
+   （--c-up=绿 / --c-down=红），与 OKX / Binance 客户端一致，且与既有
+   版本保持连续——用户在交易所看到的颜色必须和这里一样，否则会误判。
+   若某个部署场景需要 A 股红涨绿跌，只需覆写下方 4 个变量：
+       :root { --c-up: #f6465d; --c-down: #0ecb81; }
+   不要去改组件里的类名，涨跌语义由 .tone-up/.tone-down 承载。
+   ========================================================================== */
+
+:root {
+  /* --- 表面层级：靠明度差建立层次，而不是靠边框堆叠 -------------------- */
+  --bg-root: #0a0d12;          /* 页面最底 */
+  --bg-sunken: #070910;        /* 凹陷区：图表底、输入框 */
+  --bg-base: #11151d;          /* 常规面板 */
+  --bg-raised: #171c26;        /* 浮起：卡片、悬浮、下拉 */
+  --bg-overlay: #1d2330;       /* 最高层：弹窗、tooltip */
+  --bg-hover: rgba(255, 255, 255, 0.04);
+  --bg-active: rgba(255, 255, 255, 0.07);
+
+  /* --- 描边：两级足够。三级以上会让密集面板变成筛子 --------------------- */
+  --line-soft: rgba(255, 255, 255, 0.06);
+  --line: rgba(255, 255, 255, 0.11);
+  --line-strong: rgba(255, 255, 255, 0.18);
+
+  /* --- 文本：四级。每级必须在 #11151d 上达到 4.5:1 ----------------------- */
+  --tx-primary: #e9edf4;       /* 15.8:1  标题、数值 */
+  --tx-secondary: #a8b2c1;     /* 7.4:1   次要说明 */
+  --tx-tertiary: #7b8697;      /* 4.6:1   时间戳、单位 —— 卡在 AA 线 */
+  --tx-disabled: #5a6474;      /* 仅用于禁用态，不承载信息 */
+  --tx-inverse: #0a0d12;
+
+  /* --- 语义色 -------------------------------------------------------------
+     涨跌色是本界面唯一允许"大面积出现"的强色，其余全部降饱和，
+     否则界面会变成圣诞树。 */
+  --c-up: #1fc98b;             /* 涨 / 盈利 / 成功 */
+  --c-down: #f2495c;           /* 跌 / 亏损 / 危险 */
+  --c-up-soft: rgba(31, 201, 139, 0.13);
+  --c-down-soft: rgba(242, 73, 92, 0.13);
+  --c-up-line: rgba(31, 201, 139, 0.38);
+  --c-down-line: rgba(242, 73, 92, 0.38);
+
+  --c-warn: #e8a33d;           /* 注意：连亏、风控接近阈值 */
+  --c-warn-soft: rgba(232, 163, 61, 0.13);
+  --c-info: #4c8df6;
+  --c-info-soft: rgba(76, 141, 246, 0.13);
+
+  /* --- 交互主色：琥珀。OKX 品牌色，且在深底上不与涨跌色混淆 ------------- */
+  --c-accent: #f0b90b;
+  --c-accent-hover: #ffc723;
+  --c-accent-soft: rgba(240, 185, 11, 0.14);
+  --c-accent-ink: #0a0d12;     /* 压在琥珀上的文字 */
+
+  /* --- 排版 ---------------------------------------------------------------
+     基准 14px：13px 在 Windows 100% 缩放下已经开始糊，而这是需要长时间
+     盯盘的界面。可读性优先于"一屏塞更多"。
+     所有数字用 tabular-nums，否则刷新时数字宽度跳变会让人以为值变了。 */
+  --ff-sans: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  --ff-num: "SF Mono", "JetBrains Mono", Consolas, "Roboto Mono", monospace;
+
+  --fs-2xs: 10px;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 14px;
+  --fs-md: 15px;
+  --fs-lg: 18px;
+  --fs-xl: 22px;
+  --fs-2xl: 28px;
+  --fs-3xl: 34px;
+
+  --lh-tight: 1.25;
+  --lh-snug: 1.4;
+  --lh-normal: 1.55;
+
+  --fw-normal: 400;
+  --fw-medium: 500;
+  --fw-bold: 650;
+
+  /* --- 间距：4px 基准 ---------------------------------------------------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+
+  /* --- 圆角：小圆角更"专业"，大圆角在密集数据界面会显得玩具化 --------- */
+  --r-sm: 3px;
+  --r-md: 5px;
+  --r-lg: 8px;
+  --r-full: 999px;
+
+  /* --- 阴影：深底上阴影几乎不可见，靠描边+背景分层表达高度 ------------- */
+  --sh-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --sh-md: 0 4px 12px rgba(0, 0, 0, 0.45);
+  --sh-lg: 0 12px 32px rgba(0, 0, 0, 0.55);
+
+  /* --- 动效 ---------------------------------------------------------------
+     时长压到 120-180ms：盯盘时动画过慢会让人以为界面卡住。 */
+  --ease: cubic-bezier(0.2, 0, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur: 180ms;
+
+  /* --- 尺寸 -------------------------------------------------------------- */
+  --topbar-h: 56px;
+  --statusbar-h: 26px;
+  --tap-min: 32px;            /* 桌面端密集布局的下限；移动端用 --tap-min-touch */
+  --tap-min-touch: 44px;      /* WCAG 2.5.5 / 移动端 */
+
+  --z-banner: 20;
+  --z-dropdown: 40;
+  --z-toast: 60;
+}
+
+/* ==========================================================================
+   浅色主题
+   --------------------------------------------------------------------------
+   为什么必须有：有人白天靠窗办公，深色终端在强光下反光刺眼。
+   注意浅色下把涨跌色整体加深（--c-up/--c-down 由组件层的 media/class 覆写），
+   否则 #1fc98b 压在白底上只有 2.1:1，远低于 AA。
+   ========================================================================== */
+[data-theme='light'] {
+  --bg-root: #f2f4f7;
+  /* 凹陷区比面板略深，用来区分"可填入"的控件与面板。
+     注意：底色越深，上面文字的对比度越低。这里选 #f2f4f7 是平衡点——
+     压得更深会让 --c-up 在此跌到 4:1 以下，压得更浅则失去凹陷感。 */
+  --bg-sunken: #f2f4f7;
+  --bg-base: #ffffff;
+  --bg-raised: #ffffff;
+  --bg-overlay: #ffffff;
+  --bg-hover: rgba(11, 18, 32, 0.04);
+  --bg-active: rgba(11, 18, 32, 0.07);
+
+  --line-soft: rgba(11, 18, 32, 0.07);
+  --line: rgba(11, 18, 32, 0.13);
+  --line-strong: rgba(11, 18, 32, 0.22);
+
+  --tx-primary: #0b1220;       /* 18.72:1 */
+  --tx-secondary: #4a5567;     /* 7.54:1  */
+  /* 这个值是按【两种底色】挑的：三级文字大量落在 --bg-sunken(灰) 上，
+     只对白底达标是不够的。#6b7684 在灰底只有 4.19:1，压到 #667080 才双达标。 */
+  --tx-tertiary: #667080;      /* 白底 5.01:1 · 灰底 4.54:1 */
+  --tx-disabled: #9aa3b0;      /* 仅禁用态，不承载信息 */
+  --tx-inverse: #ffffff;
+
+  /* 这三个值是按对比度实测挑的，不是随手改暗的：
+     原始候选 #0a8f5f(4.11) / #a76a06(4.46) / #b8860b(3.25) 在白底上
+     全部低于正文所需的 4.5:1，深一档后才达标。
+     浅色主题的涨跌色不能直接复制深色主题的值——那套是按深底选的。
+
+     在 --bg-sunken(#f2f4f7) 上，--c-up/--c-down 分别是 4.29 / 4.48:1，
+     未达正文的 4.5 —— 这是有意保留的权衡：那里的涨跌色只用于 22px 以上的
+     成交参考价与强平价，WCAG 对 ≥18.66px 的文本只要求 3:1。
+     若压到 4.5，白底上的数字会暗到不自然，得不偿失。*/
+  --c-up: #078455;/* 4.73:1 */
+  --c-down: #d32f42;            /* 4.94:1 */
+  --c-up-soft: rgba(7, 132, 85, 0.1);
+  --c-down-soft: rgba(211, 47, 66, 0.1);
+  --c-up-line: rgba(7, 132, 85, 0.34);
+  --c-down-line: rgba(211, 47, 66, 0.34);
+
+  --c-warn: #96600a;            /* 5.28:1 */
+  --c-warn-soft: rgba(150, 96, 10, 0.1);
+  --c-info: #2563eb;            /* 5.17:1 */
+  --c-info-soft: rgba(37, 99, 235, 0.1);
+
+  --c-accent: #8a6508;          /* 5.32:1 */
+  --c-accent-hover: #78560a;
+  --c-accent-soft: rgba(138, 101, 8, 0.12);
+  --c-accent-ink: #ffffff;
+
+  --sh-sm: 0 1px 2px rgba(11, 18, 32, 0.08);
+  --sh-md: 0 4px 12px rgba(11, 18, 32, 0.1);
+  --sh-lg: 0 12px 32px rgba(11, 18, 32, 0.16);
+}
+
+/* ==========================================================================
+   基础重置
+   ========================================================================== */
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html, body, #app { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg-root);
+  color: var(--tx-primary);
+  font-family: var(--ff-sans);
+  font-size: var(--fs-base);
+  line-height: var(--lh-normal);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 所有数值：等宽 + 右对齐。数字列必须能竖着对齐比较。 */
+.num {
+  font-family: var(--ff-num);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  letter-spacing: -0.01em;
+}
+
+/* 涨跌语义类。组件里只写 .tone-up/.tone-down，不写具体颜色。 */
+.tone-up { color: var(--c-up); }
+.tone-down { color: var(--c-down); }
+.tone-warn { color: var(--c-warn); }
+.tone-info { color: var(--c-info); }
+.tone-dim { color: var(--tx-tertiary); }
+.tone-accent { color: var(--c-accent); }
+
+/* 焦点样式统一在此定义。
+   键盘用户必须能看见自己在哪 —— 这是 WCAG 2.4.7 的底线，
+   且交易界面里"焦点在哪"直接决定"会不会下错单"。 */
+:focus-visible {
+  outline: 2px solid var(--c-info);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+:focus:not(:focus-visible) { outline: none; }
+
+/* 滚动条：默认滚动条在深底上是一道白杠，抢视觉。 */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: var(--r-full);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--line-strong); background-clip: padding-box; }
+
+/* 尊重系统的"减少动态效果"设置。
+   前庭功能障碍用户会因为视差/闪烁而眩晕，这是一条硬要求不是可选项。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* 仅供屏幕阅读器 */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

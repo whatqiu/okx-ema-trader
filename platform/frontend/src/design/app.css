@@ -1,0 +1,336 @@
+/* ==========================================================================
+   OKX EMA Trader — 布局层
+   --------------------------------------------------------------------------
+   与旧版的结构性差异：
+     旧  250px | 1fr | 300px     右栏塞了 5 个功能，信号 reason 永远截断
+     新  300px | 1fr | 380px     右栏按任务拆标签页，每个任务有完整空间
+
+   高度策略：整页固定视口高，列内各自滚动。
+   不允许整页滚动——盯盘时页面会因数据增长而位移，图表位置跳变是不可接受的。
+   ========================================================================== */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+/* ======================= 顶部栏 ======================= */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  height: var(--topbar-h);
+  flex: 0 0 auto;
+  padding: 0 var(--sp-4);
+  background: var(--bg-base);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  white-space: nowrap;
+}
+
+.brand__mark {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-bold);
+  letter-spacing: 0.06em;
+  color: var(--c-accent-ink);
+  background: var(--c-accent);
+  border-radius: var(--r-sm);
+  padding: 3px 6px;
+}
+
+.brand__text { font-size: var(--fs-base); font-weight: var(--fw-bold); }
+
+.topbar__instrument { display: flex; gap: var(--sp-2); align-items: center; }
+
+.select--bar { width: 78px; flex: 0 0 auto; }
+
+/* 当前价格：视觉权重最高的数字。字号 34px 是为了让余光也能读到方向。 */
+.quote { display: flex; align-items: baseline; gap: var(--sp-3); min-width: 0; }
+.quote__last { font-size: var(--fs-3xl); font-weight: var(--fw-bold); line-height: 1; letter-spacing: -0.02em; }
+.quote__chg { font-size: var(--fs-md); font-weight: var(--fw-bold); }
+
+.topbar__status { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); }
+
+.btn--mini {
+  min-height: 20px;
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-2xs);
+  margin-left: auto;
+}
+
+/* ======================= 三栏布局 ======================= */
+.layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr) 380px;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  min-height: 0;
+}
+
+.layout__left,
+.layout__right {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-height: 0;
+  min-width: 0;
+}
+
+.layout__center {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-height: 0;
+  min-width: 0;
+}
+
+/* 面板在列内的伸缩规则：
+   panel--fill 吃掉剩余高度；普通面板按内容高度。 */
+.panel--fill { flex: 1; min-height: 120px; }
+
+.panel__body { padding: 0 var(--sp-4) var(--sp-4); }
+
+/* ======================= 账户权益 ======================= */
+.equity-head { margin: var(--sp-3) 0 var(--sp-2); }
+
+.equity-head__figure { display: flex; align-items: baseline; gap: var(--sp-2); }
+.equity-head__k { font-size: var(--fs-xs); color: var(--tx-tertiary); }
+.equity-head__v {
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-bold);
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+.equity-head__unit { font-size: var(--fs-2xs); color: var(--tx-tertiary); }
+
+/* 权益曲线占位高度：给一个确定的盒子，避免 SVG 在数据到达时把
+   下方内容整体下推（布局跳动） */
+.equity-head + .equity {
+  height: 88px;
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-2) 0;
+  background: var(--bg-sunken);
+  border-radius: var(--r-md);
+}
+
+.kv--tight .kv__row { padding: var(--sp-1) 0; }
+.kv--tight .kv__k { font-size: var(--fs-2xs); }
+.kv--tight .kv__v { font-size: var(--fs-sm); }
+
+.kv dt { margin: 0; }
+.kv dd { margin: 0; }
+
+/* ======================= 24h 行情 ======================= */
+/* 2列×3行网格，比竖排键值表省一半纵向空间 */
+.ticker-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2) var(--sp-3); margin-top: var(--sp-3); }
+.ticker-grid__cell { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.ticker-grid__k { font-size: var(--fs-2xs); color: var(--tx-tertiary); }
+.ticker-grid__cell b { font-size: var(--fs-sm); font-weight: var(--fw-medium); }
+
+/* ======================= 图表 ======================= */
+.chart-card {
+  flex: 1;
+  min-height: 0;
+  background: var(--bg-base);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+
+.statusline {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-base);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  font-size: var(--fs-xs);
+}
+.statusline__item { display: inline-flex; align-items: center; }
+.statusline__item:last-child { margin-left: auto; }
+
+/* ======================= 工作台标签页 ======================= */
+.worktabs { flex: 0 0 auto; }
+
+/* 自动交易面板：运行中用左侧色条+边框标记状态。
+   不整块染色——琥珀色大面积铺开会盖过涨跌色。 */
+.panel--live { border-color: var(--c-accent); box-shadow: inset 3px 0 0 var(--c-accent); }
+
+.auto-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+.auto-desc {
+  margin: var(--sp-2) 0 var(--sp-3);
+  font-size: var(--fs-2xs);
+  color: var(--tx-tertiary);
+  line-height: var(--lh-snug);
+}
+
+.token-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  min-height: 28px;
+  align-items: center;
+  padding: var(--sp-2);
+  background: var(--bg-sunken);
+  border-radius: var(--r-md);
+}
+.auto-hint { font-size: var(--fs-2xs); }
+
+.token-add { display: flex; gap: var(--sp-2); }
+.token-add .input { flex: 1; min-width: 0; }
+
+.auto-params {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+.auto-params .input { width: 100%; }
+
+.auto-note {
+  margin-top: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-2xs);
+  color: var(--tx-secondary);
+  background: var(--bg-sunken);
+  border-radius: var(--r-sm);
+}
+.auto-note--bad { color: var(--c-down); background: var(--c-down-soft); }
+
+/* 扫描结果 */
+.scan { display: flex; flex-direction: column; }
+.scan__row {
+  display: grid;
+  grid-template-columns: 56px 34px 1fr;
+  gap: var(--sp-2);
+  align-items: baseline;
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.scan__row:last-child { border-bottom: 0; }
+.scan__inst { font-size: var(--fs-sm); }
+.scan__hit { font-size: var(--fs-xs); font-weight: var(--fw-bold); }
+.scan__why { font-size: var(--fs-2xs); color: var(--tx-tertiary); line-height: var(--lh-snug); overflow-wrap: anywhere; }
+
+/* ======================= 回测 ======================= */
+.bt-params { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--sp-2); margin: var(--sp-3) 0; }
+
+.verdict {
+  margin: var(--sp-3) 0 0;
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  background: var(--bg-sunken);
+  border-radius: var(--r-sm);
+}
+
+.bt-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: var(--fs-xs);
+}
+.bt-row:last-child { border-bottom: 0; }
+.bt-row__days {
+  padding: 1px var(--sp-2);
+  background: var(--bg-raised);
+  border-radius: var(--r-sm);
+  color: var(--tx-secondary);
+}
+
+/* ======================= 订单历史 ======================= */
+.filters {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: center;
+  flex-wrap: wrap;
+  padding: var(--sp-3) var(--sp-4) var(--sp-2);
+}
+.filters .select { width: 110px; }
+
+.filters__summary {
+  display: flex;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  margin: 0 var(--sp-4) var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-xs);
+  color: var(--tx-secondary);
+  background: var(--bg-sunken);
+  border-radius: var(--r-sm);
+}
+.filters__summary b { color: var(--tx-primary); }
+
+.ord {
+  padding: var(--sp-2) var(--sp-3);
+  margin-bottom: var(--sp-2);
+  background: var(--bg-raised);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.ord__row { display: flex; align-items: center; gap: var(--sp-2); }
+.ord__inst { font-size: var(--fs-sm); font-weight: var(--fw-bold); }
+.ord__lev { font-size: var(--fs-2xs); color: var(--tx-tertiary); }
+.ord__pnl { margin-left: auto; font-size: var(--fs-sm); font-weight: var(--fw-bold); }
+.ord__pnl small { font-size: var(--fs-2xs); font-weight: var(--fw-normal); opacity: 0.7; }
+.ord__row--sub { font-size: var(--fs-2xs); }
+.ord__time { margin-left: auto; }
+
+.pos-list { display: flex; flex-direction: column; gap: var(--sp-2); }
+
+/* ======================= 设置条 ======================= */
+.input--proxy { max-width: 420px; flex: 1; }
+
+/* ======================= 响应式 ======================= */
+/* 平板：先收掉中栏图表的独立列宽，让两侧保持可用；
+   移动端：改为纵向堆叠，图表置顶，触控目标由 tokens.css 放大到 44px。 */
+@media (max-width: 1440px) {
+  .layout { grid-template-columns: 272px minmax(0, 1fr) 344px; }
+  .quote__last { font-size: var(--fs-2xl); }
+}
+
+@media (max-width: 1180px) {
+  .layout { grid-template-columns: 244px minmax(0, 1fr) 320px; gap: var(--sp-1); padding: var(--sp-1); }
+  .auto-params, .bt-params { grid-template-columns: 1fr 1fr; }
+}
+
+@media (max-width: 960px) {
+  .layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto auto;
+    overflow-y: auto;
+  }
+  .layout__left, .layout__right { min-height: 0; }
+  .chart-card { min-height: 320px; }
+  .quote__last { font-size: var(--fs-xl); }
+}
+
+@media (max-width: 720px) {
+  .topbar { flex-wrap: wrap; height: auto; padding: var(--sp-2) var(--sp-3); gap: var(--sp-3); }
+  .topbar__status { margin-left: 0; width: 100%; }
+  .ticker-grid { grid-template-columns: 1fr 1fr; }
+  .auto-params, .bt-params { grid-template-columns: 1fr; }
+}
