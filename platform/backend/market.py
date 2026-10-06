@@ -20,11 +20,14 @@ consumer that makes decisions reads with `only_confirmed=True`.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
 import deps
 from okx_ema_trader.http import OkxError
+
+log = logging.getLogger("platform")   # same logger as main.py -> one log file
 
 # Mirrors backtest.MINUTES_PER_BAR, in milliseconds; upper-case H/D included
 # because OKX spells them that way.
@@ -37,6 +40,11 @@ MAX_LIMIT = 300
 # Hard cap on pages per ensure_candles call: a runaway loop here is a rate-limit
 # ban, not just wasted time. 40 pages x 300 bars = 12,000 bars = 41 days of 5m.
 MAX_PAGES = 40
+# Budget for the automatic heal when the poller recovers from an outage: 10
+# pages x 300 bars = 3000 bars = ~10 days of 5m. Enough for a laptop that was
+# asleep, small enough that four symbols x two bars coming back at once cannot
+# turn into a burst that eats the whole rate-limit budget.
+HEAL_PAGES = 10
 
 
 def bar_ms(bar: str) -> int:
@@ -65,26 +73,69 @@ def refresh_latest(store, inst_id: str, bar: str, fetch=None, limit: int = 3) ->
     return store.upsert_candles(inst_id, bar, rows)
 
 
+def _fill_gap(store, inst_id: str, bar: str, gap_start: int, gap_end: int,
+              fetch, budget: int) -> tuple[int, int]:
+    """Fill the bars strictly between `gap_start` and `gap_end` (both stored).
+
+    `after` pages newest-first going back in time, so each page starts just
+    below `gap_end`; the next cursor is the oldest bar the page returned. Only
+    the part of a page that falls inside the hole is written — the rest is
+    already stored and re-writing it would just spend rows.
+
+    Returns (bars written, pages used). A page that adds nothing ends the
+    attempt: some holes are genuinely unfillable (the instrument did not trade,
+    or the bar predates listing) and paging forever at those is how a budget
+    becomes a rate-limit ban.
+    """
+    written = 0
+    used = 0
+    cursor = gap_end
+    for _ in range(budget):
+        page = fetch("/market/history-candles", {
+            "instId": inst_id, "bar": bar, "limit": str(MAX_LIMIT),
+            "after": str(cursor),
+        })
+        used += 1
+        if not page:
+            break
+        inside = [row for row in page
+                  if gap_start < int(row[0]) < gap_end]
+        if not inside:
+            break
+        written += store.upsert_candles(inst_id, bar, inside)
+        page_oldest = int(page[-1][0])
+        if page_oldest <= gap_start or len(page) < MAX_LIMIT:
+            break
+        cursor = page_oldest
+    return written, used
+
+
 def ensure_candles(store, inst_id: str, bar: str, target_bars: int = 1500,
-                   fetch=None) -> dict:
+                   fetch=None, max_pages: int = MAX_PAGES) -> dict:
     """Make the store hold ~`target_bars` recent bars, fetching only the gaps.
 
     Returns the post-sync extent {oldest, newest, count, fetched}.
+
+    Three phases, sharing ONE page budget (`max_pages`), because the budget is
+    a rate-limit concern, not a per-phase concern: a chart load that spends 40
+    pages on history and then discovers a hole has nothing left to heal it with.
     """
     fetch = fetch or deps.okx_get
     step = bar_ms(bar)
     now = int(time.time() * 1000)
     oldest, newest, count = store.candle_extent(inst_id, bar)
     fetched = 0
+    budget = max_pages
 
     # ---- 1. forward fill: local data exists but is stale ------------------
     if count and newest < now - 2 * step:
         before = newest
-        for _ in range(MAX_PAGES):
+        for _ in range(budget):
             page = fetch("/market/history-candles", {
                 "instId": inst_id, "bar": bar, "limit": str(MAX_LIMIT),
                 "before": str(before),
             })
+            budget -= 1
             if not page:
                 break
             fetched += store.upsert_candles(inst_id, bar, page)
@@ -97,27 +148,48 @@ def ensure_candles(store, inst_id: str, bar: str, target_bars: int = 1500,
         oldest, newest, count = store.candle_extent(inst_id, bar)
 
     # ---- 2. backward fill: not enough history ------------------------------
-    pages = 0
-    while count < target_bars and pages < MAX_PAGES:
+    while count < target_bars and budget > 0:
         params = {"instId": inst_id, "bar": bar, "limit": str(MAX_LIMIT)}
         if count:
             params["after"] = str(oldest)
         page = fetch("/market/history-candles", params)
+        budget -= 1
         if not page:
             break
         fetched += store.upsert_candles(inst_id, bar, page)
-        pages += 1
         page_oldest = int(page[-1][0])
         if len(page) < MAX_LIMIT or (count and page_oldest >= oldest):
             break  # OKX ran out, or we are not moving backwards anymore
         oldest = page_oldest
         count += len(page)
 
+    # ---- 2b. interior gaps: the outage case --------------------------------
+    # This is the one the other two phases cannot reach. After a disconnection
+    # the poller's refresh_latest jumps `newest` to "now" on the first
+    # successful pass, so phase 1 sees fresh data and stops, while phase 2
+    # pages AWAY from `oldest` — the hole in the middle is invisible to both
+    # and stayed there permanently until this existed.
+    holes = 0
+    for gap_start, gap_end in store.candle_gaps(inst_id, bar, step):
+        if budget <= 0:
+            log.warning("%s %s: 还有缺口未补（本轮页预算已用尽）", inst_id, bar)
+            break
+        missing = (gap_end - gap_start) // step - 1
+        written, used = _fill_gap(store, inst_id, bar, gap_start, gap_end,
+                                  fetch, budget)
+        budget -= used
+        fetched += written
+        if written:
+            holes += 1
+            log.info("%s %s: 补洞 %d/%d 根（%s -> %s）", inst_id, bar,
+                     written, missing, gap_start, gap_end)
+
     # ---- 3. always refresh the newest few bars (forming bar included) -----
     fetched += refresh_latest(store, inst_id, bar, fetch)
 
     oldest, newest, count = store.candle_extent(inst_id, bar)
-    return {"oldest": oldest, "newest": newest, "count": count, "fetched": fetched}
+    return {"oldest": oldest, "newest": newest, "count": count,
+            "fetched": fetched, "holes_filled": holes}
 
 
 def fetch_ticker(store, inst_id: str, fetch=None) -> dict:
@@ -227,6 +299,9 @@ class MarketPoller:
         # inst -> freshest tick (memory-hot; DB gets a copy once a minute)
         self._ticker_cache: dict[str, dict] = {}
         self._ticker_persisted: dict[str, float] = {}
+        # (inst, bar) pairs that failed at least once and owe a gap-fill on the
+        # first pass that succeeds again.
+        self._to_heal: set[tuple[str, str]] = set()
 
     def watch(self, inst_id: str, bar: str) -> None:
         key = (inst_id, bar)
@@ -316,10 +391,23 @@ class MarketPoller:
                 self._poll_candles(inst_id, bar)
                 self._poll_ticker(inst_id)
                 self.last_error = None
+                if (inst_id, bar) in self._to_heal:
+                    # We just came back from a failure. The bars that closed
+                    # while we were offline are missing, and refreshing the
+                    # newest 3 does not bring them back — without this the
+                    # chart keeps a hole until someone reloads it by hand.
+                    self._to_heal.discard((inst_id, bar))
+                    report = ensure_candles(self._store, inst_id, bar,
+                                            fetch=self._fetch,
+                                            max_pages=HEAL_PAGES)
+                    if report["holes_filled"]:
+                        log.info("%s %s: 恢复连接后补上了 %d 段缺口",
+                                 inst_id, bar, report["holes_filled"])
             except OkxError as exc:
                 # A dead proxy must not kill the thread — the next pass may work,
                 # and the UI reads last_error to explain stale data.
                 self.last_error = str(exc)
+                self._to_heal.add((inst_id, bar))
             self.last_poll_at = int(time.time() * 1000)
 
     def _loop(self) -> None:

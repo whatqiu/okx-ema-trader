@@ -254,6 +254,113 @@ def test_poller_updates_candles_and_ticker():
     store.close(); tmp.cleanup()
 
 
+def _store_with_a_hole(now: int, hole_bars: int = 12, old_bars: int = 5):
+    """Old block, then a hole, then the newest 3 bars — the reconnect shape.
+
+    This is what a disconnection leaves behind: the poller's very next
+    successful pass writes the newest three bars, so `newest` jumps to now
+    while everything that closed in between is simply absent.
+    """
+    store, tmp = fresh_store()
+    T0 = now - (hole_bars + 3) * STEP        # last bar of the old block
+    store.upsert_candles(INST, BAR,
+                         [make_row(T0 - i * STEP) for i in range(old_bars)])
+    store.upsert_candles(INST, BAR, [make_row(now - i * STEP) for i in range(3)])
+    return store, tmp, T0
+
+
+def _hole_aware_fetch(now: int, T0: int):
+    """Serves /market/candles and fills the hole, refuses anything else."""
+    def fetch(path, params):
+        if path == "/market/candles":
+            return page_ending_at(now, 3)
+        if path == "/market/history-candles" and "after" in params:
+            cursor = int(params["after"])
+            rows, ts = [], cursor - STEP
+            while ts > T0:                   # strictly inside the hole
+                rows.append(make_row(ts))
+                ts -= STEP
+            return rows
+        return []
+    return fetch
+
+
+def test_candle_gaps_detects_an_interior_hole():
+    """Extent says "complete"; only walking the series finds the hole."""
+    now = int(time.time() * 1000) // STEP * STEP
+    store, tmp, T0 = _store_with_a_hole(now)
+
+    gaps = store.candle_gaps(INST, BAR, STEP)
+    check(len(gaps) == 1, f"expected exactly one hole, got {gaps}")
+    check(gaps[0] == (T0, now - 2 * STEP), f"wrong hole bounds: {gaps[0]}")
+
+    # The whole point: oldest/newest/count cannot see it, so any gap logic
+    # built on the extent would decide there is nothing to do.
+    oldest, newest, count = store.candle_extent(INST, BAR)
+    check(count == 8 and newest == now,
+          "fixture should look complete from the outside")
+    store.close(); tmp.cleanup()
+
+
+def test_ensure_candles_heals_a_hole_after_reconnect():
+    now = int(time.time() * 1000) // STEP * STEP
+    store, tmp, T0 = _store_with_a_hole(now)
+
+    # target_bars below the current count: proves the hole is healed by the
+    # gap phase, not by the backward fill happening to cover it.
+    report = market.ensure_candles(store, INST, BAR, target_bars=5,
+                                   fetch=_hole_aware_fetch(now, T0))
+    check(report["holes_filled"] == 1, f"no hole reported: {report}")
+    check(store.candle_gaps(INST, BAR, STEP) == [], "hole survived the sync")
+    _, _, count = store.candle_extent(INST, BAR)
+    check(count == 20, f"expected 5 + 12 + 3 bars, got {count}")
+    store.close(); tmp.cleanup()
+
+
+def test_poller_heals_the_hole_on_the_first_pass_after_reconnect():
+    """Recovering must fix the chart by itself — no manual reload."""
+    now = int(time.time() * 1000) // STEP * STEP
+    store, tmp, T0 = _store_with_a_hole(now)
+    calls = {"n": 0}
+
+    def fetch(path, params):
+        calls["n"] += 1
+        if calls["n"] == 1:                  # the offline pass
+            raise OkxError("连不上 OKX", "network")
+        if path == "/market/ticker":
+            return [{"last": "5", "ts": str(now)}]
+        return _hole_aware_fetch(now, T0)(path, params)
+
+    poller = market.MarketPoller(store, fetch=fetch)
+    poller.watch(INST, BAR)
+    poller.poll_once()
+    check(poller.last_error is not None, "offline pass must record the error")
+    poller.poll_once()
+    check(poller.last_error is None, "online pass must clear the error")
+    check(store.candle_gaps(INST, BAR, STEP) == [],
+          "hole still there after the poller came back")
+    store.close(); tmp.cleanup()
+
+
+def test_gap_fill_stops_on_an_unfillable_hole():
+    """A hole OKX has no bars for must not become an infinite page loop."""
+    now = int(time.time() * 1000) // STEP * STEP
+    store, tmp, T0 = _store_with_a_hole(now)
+    calls = {"n": 0}
+
+    def fetch(path, params):
+        calls["n"] += 1
+        if path == "/market/candles":
+            return page_ending_at(now, 3)
+        return []                            # OKX has nothing for the hole
+
+    market.ensure_candles(store, INST, BAR, target_bars=5, fetch=fetch)
+    check(calls["n"] <= 3, f"unfillable hole caused {calls['n']} requests")
+    check(len(store.candle_gaps(INST, BAR, STEP)) == 1,
+          "hole should still be reported, just not looped over")
+    store.close(); tmp.cleanup()
+
+
 TESTS = [value for name, value in sorted(globals().items())
          if name.startswith("test_") and callable(value)]
 

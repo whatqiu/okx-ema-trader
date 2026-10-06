@@ -211,6 +211,37 @@ class Store:
             return 0, 0, 0
         return int(row[0]), int(row[1]), int(row[2])
 
+    def candle_gaps(self, inst_id: str, bar: str, step_ms: int,
+                    limit: int = 20) -> list[tuple[int, int]]:
+        """Interior holes in the stored series, as (last_bar_before, first_bar_after).
+
+        A hole is a jump between two STORED bars wider than one bar — the
+        signature of "the process was off" or "OKX was unreachable for a while".
+
+        Why this exists when `candle_extent` already reports oldest/newest/count:
+        extent cannot see a hole. The moment the newest bar is refreshed to
+        "now" after a reconnect, the series looks complete from the outside
+        (oldest is old, newest is fresh, count is high) while the middle is
+        missing — and neither the forward fill (newest is current) nor the
+        backward fill (it pages away from `oldest`) will ever touch it.
+
+        Newest-first and capped: the job is to heal a recent outage, not to
+        reconstruct the whole listing history on every chart load.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT ts FROM candles WHERE inst_id=? AND bar=? ORDER BY ts",
+                (inst_id, bar)).fetchall()
+        gaps: list[tuple[int, int]] = []
+        previous: int | None = None
+        for (raw_ts,) in rows:
+            ts = int(raw_ts)
+            if previous is not None and ts - previous > step_ms:
+                gaps.append((previous, ts))
+            previous = ts
+        gaps.reverse()
+        return gaps[:limit]
+
     def candle_rows(self, inst_id: str, bar: str, limit: int = 5000,
                     only_confirmed: bool = False) -> list[list[float]]:
         """Candles shaped exactly like `backtest.fetch_history` returns:
