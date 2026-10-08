@@ -268,23 +268,33 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
         return {"acted": False, "why": "15m frame lacks the closed bar",
                 "bar_ts": last_ts, "inst_id": inst_id}
     r15 = frame15.iloc[j]
+    # The previous 15m bar, so `classify` can see an environment FLIP. A flip is
+    # the one trigger that is guaranteed to coincide with the environment
+    # turning; without it a reversal can never produce an opposite signal.
+    p15 = frame15.iloc[j - 1] if j >= 1 else None
 
-    if any(math.isnan(float(v)) for v in
-           (r5["ema_fast"], r5["ema_slow"], p5["ema_fast"], p5["ema_slow"],
-            r15["adx"])):
+    warmup_checks = [r5["ema_fast"], r5["ema_slow"], p5["ema_fast"], p5["ema_slow"],
+                     r15["adx"]]
+    if p15 is not None:
+        warmup_checks += [p15["ema_fast"], p15["ema_slow"]]
+    if any(math.isnan(float(v)) for v in warmup_checks):
         _record_scan(store, inst_id, ts=last_ts, side=None, acted=False,
                      why="indicator warmup")
         return {"acted": False, "why": "indicator warmup",
                 "bar_ts": last_ts, "inst_id": inst_id}
 
     adx = float(r15["adx"])
+    ind_15m = {"close": float(r15["close"]), "ema_fast": float(r15["ema_fast"]),
+               "ema_slow": float(r15["ema_slow"]), "adx": adx}
+    if p15 is not None:
+        ind_15m["prev_ema_fast"] = float(p15["ema_fast"])
+        ind_15m["prev_ema_slow"] = float(p15["ema_slow"])
     signal = signal_fn(
         {"close": float(r5["close"]), "ema_fast": float(r5["ema_fast"]),
          "ema_slow": float(r5["ema_slow"]),
          "prev_ema_fast": float(p5["ema_fast"]),
          "prev_ema_slow": float(p5["ema_slow"])},
-        {"close": float(r15["close"]), "ema_fast": float(r15["ema_fast"]),
-         "ema_slow": float(r15["ema_slow"]), "adx": adx},
+        ind_15m,
         cfg.adx_min, cfg.deviation_max,
     )
 

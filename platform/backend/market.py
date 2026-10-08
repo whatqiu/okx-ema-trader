@@ -21,6 +21,7 @@ consumer that makes decisions reads with `only_confirmed=True`.
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 
@@ -37,9 +38,18 @@ BAR_MS = {
     "1D": 86_400_000,
 }
 MAX_LIMIT = 300
-# Hard cap on pages per ensure_candles call: a runaway loop here is a rate-limit
-# ban, not just wasted time. 40 pages x 300 bars = 12,000 bars = 41 days of 5m.
-MAX_PAGES = 40
+CHART_HISTORY_DAYS = 30
+# Eight history pages keep an interactive chart request bounded at 2,400 bars:
+# all of 1H and most of 15m arrive in the first pass, without making a cold 5m
+# chart wait for all ~29 pages. The remainder belongs to the serial warmer.
+SYNC_MAX_PAGES = 8
+# Forty pages x 300 bars = 12,000 bars = 41 days of 5m. This is deliberately
+# below the store's 45-day retention window, otherwise the janitor and warmer
+# would continually delete and re-download the same oldest pages.
+WARM_MAX_PAGES = 40
+# Kept as the public/default ensure budget: existing explicit callers and tests
+# rely on a full historical fill unless they opt into the request-path budget.
+MAX_PAGES = WARM_MAX_PAGES
 # Budget for the automatic heal when the poller recovers from an outage: 10
 # pages x 300 bars = 3000 bars = ~10 days of 5m. Enough for a laptop that was
 # asleep, small enough that four symbols x two bars coming back at once cannot
@@ -51,6 +61,20 @@ def bar_ms(bar: str) -> int:
     if bar not in BAR_MS:
         raise ValueError(f"unsupported bar {bar!r}; valid: {sorted(BAR_MS)}")
     return BAR_MS[bar]
+
+
+def bars_for_days(bar: str, days: int = CHART_HISTORY_DAYS) -> int:
+    """Return the chart depth for a calendar span at one bar interval.
+
+    Thirty is the floor because every supported chart should have enough points
+    to show a trend even when a caller asks for only a day or two. Keeping the
+    floor at the 30-day horizon is also important: a 200-bar floor on ``1D``
+    would exceed SQLite's 45-day retention and make the janitor and warmer fight
+    over the same rows forever.
+    """
+    if days < 1:
+        raise ValueError("days must be at least 1")
+    return max(30, days * 86_400_000 // bar_ms(bar))
 
 
 def _f(value):
@@ -110,22 +134,40 @@ def _fill_gap(store, inst_id: str, bar: str, gap_start: int, gap_end: int,
     return written, used
 
 
-def ensure_candles(store, inst_id: str, bar: str, target_bars: int = 1500,
-                   fetch=None, max_pages: int = MAX_PAGES) -> dict:
-    """Make the store hold ~`target_bars` recent bars, fetching only the gaps.
+def ensure_candles(store, inst_id: str, bar: str,
+                   target_bars: int | None = None, fetch=None,
+                   max_pages: int = MAX_PAGES) -> dict:
+    """Make the store hold the requested recent depth, fetching only gaps.
 
-    Returns the post-sync extent {oldest, newest, count, fetched}.
+    Omitting ``target_bars`` means the platform-wide 30-day chart horizon. The
+    returned extent always contains ``oldest``, ``newest``, ``count``,
+    ``fetched`` and ``holes_filled``.
 
-    Three phases, sharing ONE page budget (`max_pages`), because the budget is
-    a rate-limit concern, not a per-phase concern: a chart load that spends 40
-    pages on history and then discovers a hole has nothing left to heal it with.
+    Three phases share ONE page budget (``max_pages``), because the budget is a
+    rate-limit concern, not a per-phase concern: a chart load that spends every
+    page on history must not silently spend another full budget on a hole.
     """
+    if target_bars is None:
+        target_bars = bars_for_days(bar)
+    elif target_bars < 1:
+        raise ValueError("target_bars must be at least 1")
+    if max_pages < 0:
+        raise ValueError("max_pages must not be negative")
+
     fetch = fetch or deps.okx_get
     step = bar_ms(bar)
     now = int(time.time() * 1000)
     oldest, newest, count = store.candle_extent(inst_id, bar)
     fetched = 0
     budget = max_pages
+
+    # A warm, continuous store is the dominant path (the chart asks every five
+    # seconds). Returning before even refresh_latest is what makes repeated
+    # schedules cost zero OKX requests rather than one "cheap" request forever.
+    if (count >= target_bars and newest >= now - 2 * step
+            and not store.candle_gaps(inst_id, bar, step)):
+        return {"oldest": oldest, "newest": newest, "count": count,
+                "fetched": 0, "holes_filled": 0}
 
     # ---- 1. forward fill: local data exists but is stale ------------------
     if count and newest < now - 2 * step:
@@ -190,6 +232,111 @@ def ensure_candles(store, inst_id: str, bar: str, target_bars: int = 1500,
     oldest, newest, count = store.candle_extent(inst_id, bar)
     return {"oldest": oldest, "newest": newest, "count": count,
             "fetched": fetched, "holes_filled": holes}
+
+
+class HistoryWarmer:
+    """Serially extend chart histories without holding an HTTP request open.
+
+    A cold 30-day 5m series needs about 29 paginated OKX requests (roughly three
+    seconds behind the shared throttle). Doing that synchronously would freeze
+    the chart's first paint, while parallel warmers would compete with ticker
+    and strategy traffic for the same 20-requests-per-two-seconds allowance.
+    One daemon worker therefore owns one FIFO and fills exactly one key at once.
+    """
+
+    def __init__(self, fetch=None) -> None:
+        self._fetch = fetch
+        self._queue: queue.Queue[tuple[object, str, str]] = queue.Queue()
+        self._pending: set[tuple[str, str]] = set()
+        self._complete: set[tuple[str, str]] = set()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="history-warmer")
+        self._thread.start()
+
+    def schedule(self, store, inst_id: str, bar: str) -> bool:
+        """Queue one history key without waiting; return whether it was added.
+
+        ``_pending`` covers both queued and currently-running work. ``_complete``
+        keeps the five-second frontend poll from enqueueing a no-op forever once
+        the target is reached. Failed or page-limited work is deliberately
+        removed, so a later request can resume from the rows already persisted.
+        """
+        key = (inst_id, bar)
+        with self._lock:
+            if (self._stop.is_set() or key in self._pending
+                    or key in self._complete):
+                return False
+            self._pending.add(key)
+        self._queue.put_nowait((store, inst_id, bar))
+        return True
+
+    def stop(self) -> None:
+        """Request shutdown and wait briefly for the current page loop."""
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                store, inst_id, bar = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            key = (inst_id, bar)
+            completed = False
+            try:
+                report = ensure_candles(store, inst_id, bar,
+                                        fetch=self._fetch,
+                                        max_pages=WARM_MAX_PAGES)
+                completed = report["count"] >= bars_for_days(bar)
+            except Exception:
+                # This worker is an optimisation around a healthy request path,
+                # not part of process liveness. An upstream or SQLite failure is
+                # logged for diagnosis and retried only when a later request
+                # schedules the key again; it must never terminate the thread.
+                log.exception("%s %s: 后台历史预热失败", inst_id, bar)
+            finally:
+                # Store connections are thread-local. Leaving this worker's
+                # connection attached to a completed temporary/store key keeps
+                # the SQLite file locked on Windows and also retains one handle
+                # per Store ever queued. Closing here affects only this thread;
+                # request and poller connections remain untouched.
+                close_store = getattr(store, "close", None)
+                if callable(close_store):
+                    try:
+                        close_store()
+                    except Exception:
+                        log.exception("%s %s: 关闭预热线程数据库连接失败",
+                                      inst_id, bar)
+                with self._lock:
+                    self._pending.discard(key)
+                    if completed:
+                        self._complete.add(key)
+                self._queue.task_done()
+
+
+_warmer: HistoryWarmer | None = None
+_warmer_lock = threading.Lock()
+
+
+def get_warmer() -> HistoryWarmer:
+    """Return the process-wide history warmer, creating it lazily."""
+    global _warmer
+    with _warmer_lock:
+        if _warmer is None:
+            _warmer = HistoryWarmer()
+        return _warmer
+
+
+def stop_warmer() -> None:
+    """Stop and forget the process-wide warmer during application shutdown."""
+    global _warmer
+    with _warmer_lock:
+        warmer = _warmer
+        _warmer = None
+    if warmer is not None:
+        warmer.stop()
 
 
 def fetch_ticker(store, inst_id: str, fetch=None) -> dict:
@@ -445,9 +592,15 @@ class MarketPoller:
                     # newest 3 does not bring them back — without this the
                     # chart keeps a hole until someone reloads it by hand.
                     self._to_heal.discard((inst_id, bar))
-                    report = ensure_candles(self._store, inst_id, bar,
-                                            fetch=self._fetch,
-                                            max_pages=HEAL_PAGES)
+                    # Recovery owns a small budget specifically for the outage
+                    # hole. Passing the current count prevents the new 30-day
+                    # default from spending all ten pages extending the oldest
+                    # edge before phase 2b ever reaches that interior gap.
+                    current_count = self._store.candle_extent(inst_id, bar)[2]
+                    report = ensure_candles(
+                        self._store, inst_id, bar,
+                        target_bars=max(current_count, 1),
+                        fetch=self._fetch, max_pages=HEAL_PAGES)
                     if report["holes_filled"]:
                         log.info("%s %s: 恢复连接后补上了 %d 段缺口",
                                  inst_id, bar, report["holes_filled"])

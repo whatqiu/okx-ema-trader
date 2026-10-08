@@ -50,6 +50,8 @@ class Fill:
     notional: float  # quote currency
     stop_price: float
     stop_order_id: str
+    # 0.0 = 没挂止盈。记在 Fill 里是为了让账本和日志能说清"这一笔在哪结束"。
+    take_profit_price: float = 0.0
 
 
 def to_ccxt_symbol(symbol: str) -> str:
@@ -232,8 +234,14 @@ class Broker:
 
     # ----------------------------------------------------------------- entries
     def market_entry(self, symbol: str, side: str, notional_usdt: float,
-                     leverage: int, stop_pct: float, client_id: str | None = None) -> Fill:
-        """Open a position with a hard stop attached in the same request."""
+                     leverage: int, stop_pct: float, client_id: str | None = None,
+                     take_profit_pct: float = 0.0) -> Fill:
+        """Open a position with a hard stop attached in the same request.
+
+        `stop_pct` / `take_profit_pct` are percentages of the ENTRY PRICE, not
+        of account equity and not of PnL: 2 at 25x means the account swings
+        ~50% on that position, which is a very different trade than 2 at 1x.
+        """
         if side not in ("long", "short"):
             raise BrokerError(f"side must be long/short, got {side!r}")
 
@@ -247,24 +255,37 @@ class Broker:
             raise BrokerError(too_big)
 
         ccxt_side = "buy" if side == "long" else "sell"
-        # Stop sits below entry for a long, above for a short.
+        # Stop sits below entry for a long, above for a short; take profit the
+        # other way round. Both are distances from the entry price.
         stop_price = price * (1 - stop_pct / 100) if side == "long" else price * (1 + stop_pct / 100)
         stop_price = self.exchange.price_to_precision(to_ccxt_symbol(symbol), stop_price)
+
+        tp_price = 0.0
+        if take_profit_pct > 0:
+            tp_price = (price * (1 + take_profit_pct / 100) if side == "long"
+                        else price * (1 - take_profit_pct / 100))
+            tp_price = self.exchange.price_to_precision(to_ccxt_symbol(symbol), tp_price)
 
         params: dict = {
             "tdMode": "cross",
             "posSide": "net",
             "stopLoss": {"triggerPrice": stop_price, "type": "market"},
         }
+        if tp_price:
+            # ccxt folds both into one attachAlgoOrd, so this is still a single
+            # conditional order carrying slTriggerPx + tpTriggerPx. `_find_stop_id`
+            # keys off slTriggerPx and keeps working.
+            params["takeProfit"] = {"triggerPrice": tp_price, "type": "market"}
         if client_id:
             params["clOrdId"] = client_id
 
         if self.dry_run:
             notional = self.notional_for_contracts(symbol, size, price)
-            log.info("[dry-run] would open %s %s size=%s contracts (%.2f USDT) @~%.6f stop=%s",
-                     side, symbol, size, notional, price, stop_price)
+            log.info("[dry-run] would open %s %s size=%s contracts (%.2f USDT) @~%.6f stop=%s tp=%s",
+                     side, symbol, size, notional, price, stop_price, tp_price or "-")
             return Fill(order_id="dry-run", side=side, price=price, size=size,
-                        notional=notional, stop_price=float(stop_price), stop_order_id="dry-run")
+                        notional=notional, stop_price=float(stop_price),
+                        stop_order_id="dry-run", take_profit_price=float(tp_price or 0.0))
 
         try:
             order = self.exchange.create_order(
@@ -289,8 +310,9 @@ class Broker:
         # contract as one coin. On BTC-USDT-SWAP that overstates the position
         # 100x, and the ledger recorded the inflated number as truth.
         notional = self.notional_for_contracts(symbol, filled, fill_price)
-        log.info("opened %s %s size=%s filled@%.6f notional=%.2f stop=%.2f (%s)",
-                 side, symbol, filled, fill_price, notional, float(stop_price), stop_id)
+        log.info("opened %s %s size=%s filled@%.6f notional=%.2f stop=%.2f tp=%s (%s)",
+                 side, symbol, filled, fill_price, notional, float(stop_price),
+                 tp_price or "-", stop_id)
         return Fill(
             order_id=str(order.get("id") or ""),
             side=side,
@@ -299,6 +321,7 @@ class Broker:
             notional=notional,
             stop_price=float(stop_price),
             stop_order_id=str(stop_id),
+            take_profit_price=float(tp_price or 0.0),
         )
 
     def _find_stop_id(self, symbol: str, order_id: str | None) -> str | None:

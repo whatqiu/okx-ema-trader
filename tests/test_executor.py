@@ -252,12 +252,15 @@ def test_config_values() -> int:
     if bad:
         print(f"  FAIL symbols not in instId form: {bad}")
         failures += 1
-    # Risk parameters must be untouched.
-    if config.trading.leverage != 10 or config.trading.equity_pct != 100.0 \
-            or config.trading.stop_loss_pct != 3.0:
+    # Risk parameters must be untouched. These are the numbers the account is
+    # actually risked on, so pinning them is the point: a stray edit to leverage
+    # or stop distance silently changes what one losing trade costs.
+    if config.trading.leverage != 25 or config.trading.equity_pct != 20.0 \
+            or config.trading.stop_loss_pct != 2.0 \
+            or config.trading.take_profit_pct != 2.0:
         print("  FAIL risk parameters changed: "
               f"lev={config.trading.leverage} eq={config.trading.equity_pct} "
-              f"stop={config.trading.stop_loss_pct}")
+              f"stop={config.trading.stop_loss_pct} tp={config.trading.take_profit_pct}")
         failures += 1
     # The circuit-breaker limits live in config now, so they are just as easy to
     # change by accident as leverage is — and a stray edit here silently moves

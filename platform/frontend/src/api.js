@@ -28,8 +28,8 @@ export const api = {
   status: () => request('/api/status'),
   riskCheck: () => request('/api/risk/check', { method: 'POST' }),
   riskReset: () => request('/api/risk/reset', { method: 'POST' }),
-  candles: (symbol, bar, limit = 500, sync = true) =>
-    request(`/api/candles?symbol=${encodeURIComponent(symbol)}&bar=${bar}&limit=${limit}&sync=${sync}`),
+  candles: (symbol, bar, limit = 500, sync = true, since = 0) =>
+    request(`/api/candles?symbol=${encodeURIComponent(symbol)}&bar=${bar}&limit=${limit}&sync=${sync}${since > 0 ? `&since=${since}` : ''}`),
   ticker: (symbol) => request(`/api/ticker?symbol=${encodeURIComponent(symbol)}`),
   orders: ({ symbol, status, limit = 100 } = {}) => {
     const p = new URLSearchParams()

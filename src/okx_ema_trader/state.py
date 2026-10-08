@@ -39,6 +39,8 @@ class Position:
     entry_order_id: str = ""
     stop_order_id: str = ""
     stop_price: float = 0.0
+    # 0.0 = 没挂止盈。记下来是为了排查"这一笔到底是被止盈还是被止损结束的"。
+    take_profit_price: float = 0.0
     # True = 这笔仓位的已实现盈亏已经结算进风控计数（见 risk_guard.RiskGuard）。
     # 只在"账本还记着、交易所已经没了"时置位：那种情况几乎总是止损被打掉，
     # 而策略侧的 _flip 根本不会经过，不补记一笔连亏计数就永远是 0。
@@ -68,6 +70,7 @@ class Position:
             entry_order_id=str(raw.get("entry_order_id", "") or ""),
             stop_order_id=str(raw.get("stop_order_id", "") or ""),
             stop_price=float(raw.get("stop_price", 0.0) or 0.0),
+            take_profit_price=float(raw.get("take_profit_price", 0.0) or 0.0),
             settled=bool(raw.get("settled", False)),
         )
 
@@ -121,6 +124,10 @@ class Ledger:
     path: Path | None = None
     # 账户级熔断状态，和持仓写在同一个文件里：熔断必须和"我持有什么"一样持久。
     risk: RiskState = field(default_factory=RiskState)
+    # 上一次出场的"信号身份" "side:15m_bar_ts"，用于「出场后观望，等下一个
+    # 信号」。同一个 15m 环境翻转会连续几根 5m bar 都发出同一方向的信号，
+    # 止盈/止损成交后若立刻重进，等于刚离场就买回同一个仓位。
+    last_exit: dict[str, str] = field(default_factory=dict)
 
     def get(self, symbol: str) -> Position:
         """Ledger's view of a symbol; flat when never traded."""
@@ -149,6 +156,7 @@ class Ledger:
             "version": SCHEMA_VERSION,
             "positions": {sym: asdict(pos) for sym, pos in self.positions.items()},
             "risk": self.risk.to_dict(),
+            "last_exit": dict(self.last_exit),
         }
 
     def save(self) -> None:
@@ -206,5 +214,11 @@ class Ledger:
             raise StateError(f"{path} 'positions' should be a mapping, got {type(positions_raw).__name__}")
 
         positions = {str(sym): Position.from_dict(entry) for sym, entry in positions_raw.items()}
+        # 旧文件没有 last_exit；缺失即空字典，不升 SCHEMA_VERSION（升级会让每个
+        # 已有 state.yaml 变成"启动即崩"，见 RiskState.from_dict 的同样取舍）。
+        last_exit_raw = raw.get("last_exit") or {}
+        last_exit = ({str(k): str(v) for k, v in last_exit_raw.items()}
+                     if isinstance(last_exit_raw, dict) else {})
         return cls(positions=positions, path=path,
-                   risk=RiskState.from_dict(raw.get("risk") or {}))
+                   risk=RiskState.from_dict(raw.get("risk") or {}),
+                   last_exit=last_exit)

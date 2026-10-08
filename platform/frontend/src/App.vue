@@ -17,10 +17,21 @@ const BAR_MS = {
   '1m': 60000, '3m': 180000, '5m': 300000, '15m': 900000,
   '30m': 1800000, '1H': 3600000, '4H': 14400000, '1D': 86400000,
 }
+const CHART_HISTORY_DAYS = 30
+
+/**
+ * 浏览器只保留当前周期 30 天的数据；5m 的 8,640 根在传输层受 5,000
+ * 上限约束。请求、增量合并和 ticker 开新根共用这一函数，避免任意一层
+ * 又把已经补齐的历史悄悄裁回旧的 500 根。
+ */
+function historyLimit(timeframe) {
+  return Math.min(5000, Math.round(CHART_HISTORY_DAYS * 86400000 / BAR_MS[timeframe]))
+}
 
 const symbol = ref(localStorage.getItem('symbol') || 'MU')
 const bar = ref(localStorage.getItem('bar') || '5m')
 const rows = ref([])
+const candleExtent = ref(null)
 const ticker = ref(null)
 const signals = ref([])
 const signalLog = ref([])
@@ -227,14 +238,49 @@ async function guard(fn, silent = false) {
   }
 }
 
+/**
+ * 用时间戳覆盖合并增量：未收盘的最后一根会被服务端修正，新开的根则
+ * 追加。空增量直接复用原数组，避免 KlineChart 在无行情变化时重绘。
+ */
+function mergeRows(base, incoming) {
+  if (!incoming?.length) return base
+  const byTimestamp = new Map(base.map(row => [row[0], row]))
+  for (const row of incoming) byTimestamp.set(row[0], row)
+  const merged = [...byTimestamp.values()].sort((left, right) => left[0] - right[0])
+  const maxRows = historyLimit(bar.value)
+  return merged.length > maxRows ? merged.slice(-maxRows) : merged
+}
+
 async function loadCandles(sync) {
-  syncing.value = true
+  if (sync) {
+    syncing.value = true
+    candleExtent.value = null
+  }
   await guard(async () => {
-    const data = await api.candles(symbol.value, bar.value, 500, sync)
-    rows.value = data.rows
+    let data
+    const wasWarming = candleExtent.value?.warming === true
+    if (sync) {
+      data = await api.candles(
+        symbol.value, bar.value, historyLimit(bar.value), true)
+      rows.value = data.rows
+    } else {
+      const since = rows.value.length ? rows.value[rows.value.length - 1][0] : 0
+      data = await api.candles(symbol.value, bar.value, 600, false, since)
+      rows.value = mergeRows(rows.value, data.rows)
+      // 增量响应故意只带最新几根，因此后台补入的更老历史不会通过
+      // ``since`` 回来。预热完成的那个轮次只从本地完整读取一次，之后
+      // 仍恢复小增量；没有这一步，状态会显示“补全”但图上永远是首批。
+      if (wasWarming && !data.extent?.warming
+          && rows.value.length < historyLimit(bar.value)) {
+        data = await api.candles(
+          symbol.value, bar.value, historyLimit(bar.value), false)
+        rows.value = data.rows
+      }
+    }
+    candleExtent.value = data.extent
     lastUpdate.value = Date.now()
   }, true)
-  syncing.value = false
+  if (sync) syncing.value = false
 }
 
 async function loadTicker() {
@@ -262,7 +308,10 @@ function mergeTickIntoCandle() {
     if (t.last < last[3]) last[3] = t.last
   } else if (bucket > last[0]) {
     rows.value.push([bucket, t.last, t.last, t.last, t.last, 0, 0])
-    if (rows.value.length > 500) rows.value.shift()
+    // 上限必须跟着请求深度走；固定裁成 500 会让已经补到浏览器的
+    // 30 天历史在每次 ticker 跨周期开新根时再次缩水。
+    const excess = rows.value.length - historyLimit(bar.value)
+    if (excess > 0) rows.value.splice(0, excess)
   }
   rows.value = rows.value.slice()  // 嵌套数组变更需手动触发响应式
 }
@@ -691,7 +740,11 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
         <div class="statusline">
           <span class="statusline__item">
             <span :class="syncing ? 'tone-accent' : 'tone-dim'">
-              {{ syncing ? '⟳ 正在从 OKX 补拉缺口…' : `本地 K 线 ${rows.length} 根` }}
+              {{ syncing
+                ? '⟳ 正在从 OKX 补拉缺口…'
+                : candleExtent?.warming
+                  ? `⟳ 正在补全历史…（本地 ${rows.length} 根）`
+                  : `本地 K 线 ${rows.length} 根` }}
             </span>
           </span>
           <span v-if="stats" class="statusline__item tone-dim num">

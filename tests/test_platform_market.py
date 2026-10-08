@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +51,16 @@ def page_ending_at(newest_ts: int, n: int):
 def fresh_store():
     tmp = tempfile.TemporaryDirectory()
     return Store(Path(tmp.name) / "test.db"), tmp
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+    """Wait for a daemon worker without baking a machine-speed sleep into tests."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 
 # --------------------------------------------------------------------------
@@ -95,6 +107,15 @@ def test_bar_ms_rejects_unknown_bar():
     raise AssertionError("bar_ms accepted an unsupported bar")
 
 
+def test_bars_for_days_uses_calendar_math_and_daily_floor():
+    check(market.bars_for_days("5m", 30) == 8640,
+          "30 days of 5m must be exactly 8,640 bars")
+    check(market.bars_for_days("1D", 30) == 30,
+          "30 daily bars must both satisfy the math and the chart floor")
+    check(market.bars_for_days("1D", 1) == 30,
+          "short daily requests still need the 30-bar presentation floor")
+
+
 # --------------------------------------------------------------------------
 # Backward fill
 # --------------------------------------------------------------------------
@@ -115,6 +136,55 @@ def test_backward_fill_pages_until_target():
     history_calls = [c for c in calls if "before" not in c]
     check(len(history_calls) <= 4,
           f"700 bars should take ~3 pages, took {len(history_calls)}")
+    store.close(); tmp.cleanup()
+
+
+def test_default_target_backfills_thirty_days():
+    store, tmp = fresh_store()
+    now = int(time.time() * 1000) // STEP * STEP
+    calls = []
+
+    def fetch(path, params):
+        calls.append((path, dict(params)))
+        if path == "/market/candles":
+            return page_ending_at(now, 1)
+        after = int(params["after"]) if "after" in params else now + STEP
+        return page_ending_at(after - STEP, market.MAX_LIMIT)
+
+    report = market.ensure_candles(store, INST, BAR, fetch=fetch)
+    target = market.bars_for_days(BAR)
+    history_calls = [call for call in calls
+                     if call[0] == "/market/history-candles"]
+    expected_pages = (target + market.MAX_LIMIT - 1) // market.MAX_LIMIT
+    check(report["count"] >= target,
+          f"default target stopped at {report['count']} of {target} bars")
+    check(len(history_calls) == expected_pages,
+          f"expected {expected_pages} history pages, got {len(history_calls)}")
+    store.close(); tmp.cleanup()
+
+
+def test_default_target_is_idempotent_after_thirty_day_fill():
+    store, tmp = fresh_store()
+    now = int(time.time() * 1000) // STEP * STEP
+
+    def fetch(path, params):
+        if path == "/market/candles":
+            return page_ending_at(now, 1)
+        after = int(params["after"]) if "after" in params else now + STEP
+        return page_ending_at(after - STEP, market.MAX_LIMIT)
+
+    market.ensure_candles(store, INST, BAR, fetch=fetch)
+    calls = []
+
+    def counting_fetch(path, params):
+        calls.append(path)
+        return fetch(path, params)
+
+    report = market.ensure_candles(store, INST, BAR, fetch=counting_fetch)
+    check(report["count"] >= market.bars_for_days(BAR),
+          "the idempotent pass lost already-stored history")
+    check(calls == [],
+          f"a warm default target must make zero OKX calls, got {calls}")
     store.close(); tmp.cleanup()
 
 
@@ -182,6 +252,95 @@ def test_forward_fill_closes_gap():
     check(count >= 60, f"hole left behind: count {count} < 60")
     check(newest >= now - 2 * STEP, "forward fill did not catch up to now")
     store.close(); tmp.cleanup()
+
+
+# --------------------------------------------------------------------------
+# Background history warmer
+# --------------------------------------------------------------------------
+def test_history_warmer_schedule_is_nonblocking_and_deduplicates():
+    store, tmp = fresh_store()
+    entered_fetch = threading.Event()
+    release_fetch = threading.Event()
+    history_calls = []
+
+    def fetch(path, params):
+        if path == "/market/history-candles":
+            history_calls.append(dict(params))
+            entered_fetch.set()
+            release_fetch.wait(timeout=2.0)
+        return []
+
+    warmer = market.HistoryWarmer(fetch=fetch)
+    try:
+        started_at = time.monotonic()
+        first_added = warmer.schedule(store, INST, BAR)
+        elapsed = time.monotonic() - started_at
+        check(first_added and elapsed < 0.1,
+              f"schedule blocked the request path for {elapsed:.3f}s")
+        check(entered_fetch.wait(timeout=1.0), "warmer never started queued work")
+        duplicate_results = [warmer.schedule(store, INST, BAR) for _ in range(5)]
+        check(not any(duplicate_results),
+              "a key already being processed must not be queued again")
+        release_fetch.set()
+        check(wait_until(lambda: not warmer._pending),
+              "warmer did not finish the queued key")
+        check(len(history_calls) == 1,
+              f"duplicate schedules triggered {len(history_calls)} history calls")
+    finally:
+        release_fetch.set()
+        warmer.stop()
+        store.close(); tmp.cleanup()
+
+
+def test_history_warmer_survives_worker_exception():
+    store, tmp = fresh_store()
+    attempted = threading.Event()
+
+    def broken(path, params):
+        attempted.set()
+        raise OkxError("预热测试断网", "network")
+
+    warmer = market.HistoryWarmer(fetch=broken)
+    try:
+        check(warmer.schedule(store, INST, BAR), "failed key was not scheduled")
+        check(attempted.wait(timeout=1.0), "worker never called the fetcher")
+        check(wait_until(lambda: not warmer._pending),
+              "failed work remained permanently pending")
+        check(warmer._thread.is_alive(),
+              "an OkxError escaped and killed the history worker")
+    finally:
+        warmer.stop()
+        store.close(); tmp.cleanup()
+
+
+def test_history_warmer_reaches_thirty_day_depth():
+    store, tmp = fresh_store()
+    now = int(time.time() * 1000) // STEP * STEP
+    history_calls = []
+
+    def fetch(path, params):
+        if path == "/market/candles":
+            return page_ending_at(now, 1)
+        history_calls.append(dict(params))
+        after = int(params["after"]) if "after" in params else now + STEP
+        return page_ending_at(after - STEP, market.MAX_LIMIT)
+
+    warmer = market.HistoryWarmer(fetch=fetch)
+    try:
+        check(warmer.schedule(store, INST, BAR), "cold history was not scheduled")
+        target = market.bars_for_days(BAR)
+        check(wait_until(lambda: store.candle_extent(INST, BAR)[2] >= target),
+              "background warmer did not reach the 30-day target")
+        check(wait_until(lambda: (INST, BAR) in warmer._complete),
+              "completed history was not marked for future deduplication")
+        expected_pages = (target + market.MAX_LIMIT - 1) // market.MAX_LIMIT
+        check(len(history_calls) == expected_pages,
+              f"warmer used {len(history_calls)} pages, expected {expected_pages}")
+        check(not warmer.schedule(store, INST, BAR),
+              "an already-complete key must not be queued again")
+    finally:
+        warmer.stop()
+        store.close(); tmp.cleanup()
 
 
 # --------------------------------------------------------------------------

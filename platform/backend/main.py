@@ -193,6 +193,53 @@ def _auto_loop() -> None:
         _auto_pass()
 
 
+def _boot_sync() -> None:
+    """One-shot startup task: heal candle holes on every auto-traded symbol.
+
+    Without this, a platform that was offline for hours boots into fresh OKX
+    connectivity; the poller's first poll is a SUCCESS (so it never enters the
+    failure-recovery branch that triggers `ensure_candles` for interior gaps),
+    and the chart keeps whatever outage hole the last shutdown left behind —
+    until someone manually reloads it. We treat boot as the recovery event the
+    poller can't see, and only auto-trade symbols matter: ad-hoc chart symbols
+    still get their first-paint sync from `/api/candles?sync=true`.
+    """
+    try:
+        cfg = deps.config()
+        store = deps.store()
+        symbols = autotrader.get_state(store)["symbols"]
+        log.info("boot-sync 开始：%d 个自动交易币种", len(symbols))
+        fixed_total = 0
+        for inst in symbols:
+            for bar in (cfg.bar_5m, cfg.bar_15m):
+                try:
+                    step = market.bar_ms(bar)
+                    before = len(store.candle_gaps(inst, bar, step))
+                    market.ensure_candles(
+                        store, inst, bar,
+                        target_bars=market.bars_for_days(bar),
+                        max_pages=market.HEAL_PAGES)
+                    # `holes_filled` in the report only counts phase 2b, but
+                    # phase 1 forward fill also closes outage holes as a side
+                    # effect — and that still leaves the chart continuous,
+                    # which is what the user sees. Diff the gap count before
+                    # vs. after so the log reflects actual work done.
+                    after = len(store.candle_gaps(inst, bar, step))
+                    if after < before:
+                        log.info("%s %s: 启动时补上 %d 段缺口",
+                                 inst, bar, before - after)
+                        fixed_total += before - after
+                except Exception:
+                    log.exception("%s %s: 启动补数失败", inst, bar)
+        log.info("boot-sync 完成：共补 %d 段缺口", fixed_total)
+    except Exception:
+        # `_boot_sync` exists to make the first chart paint continuous. Failing
+        # here must NOT abort startup — the chart will still self-heal on first
+        # request. The only consequence of this failing is "first paint is
+        # missing some bars", which is the pre-fix behaviour anyway.
+        log.exception("boot-sync 整体失败，跳过启动补数")
+
+
 def _watchdog_loop() -> None:
     """Every 5s: prove OKX is still reachable, and mirror that into the ticker.
 
@@ -238,10 +285,20 @@ async def lifespan(app: FastAPI):
                                       name="db-janitor")
     janitor_thread.start()
     _prune_safe()  # startup sweep: a laptop that was off for days has stale rows
+    # Heal candle holes from the last shutdown BEFORE the first poll. A cold
+    # poller that boots into fresh OKX connectivity does NOT enter the
+    # failure-recovery path (`_to_heal` stays empty), so the interior-gap
+    # healer is never triggered — which leaves the chart with the outage hole
+    # from whenever the platform was last shut down, until someone clicks
+    # refresh. This makes the first paint after boot continuous.
+    boot_sync = threading.Thread(target=_boot_sync, daemon=True,
+                                 name="boot-sync")
+    boot_sync.start()
     yield
     _auto_stop.set()
     _janitor_stop.set()
     _poller.stop()
+    market.stop_warmer()
 
 
 app = FastAPI(title="okx-ema-trader platform", lifespan=lifespan)
@@ -337,22 +394,51 @@ def health_liveness():
 @app.get("/api/candles")
 def candles(symbol: str = Query(...), bar: str = Query("5m"),
             limit: int = Query(500, ge=1, le=5000),
-            sync: bool = Query(True)):
-    """Local-first candles, oldest first.
+            sync: bool = Query(True), since: int = Query(0, ge=0)):
+    """Serve local candles oldest-first and progressively warm 30-day history.
 
-    `sync=true` (default) fills gaps from OKX before reading; `sync=false`
-    serves exactly what is on disk — useful for checking what the poller has
-    actually fetched without triggering more traffic.
+    A normal load spends at most eight history pages before returning, then the
+    serial warmer finishes the remaining pages without blocking first paint.
+    ``since`` is the five-second incremental path: it never paginates OKX, but
+    still refreshes the poller's LRU subscription and reports warming progress.
     """
     inst = _symbol(symbol)
     tf = _bar(bar)
     store = deps.store()
+    history_target = market.bars_for_days(tf)
+    # In incremental mode ``limit=600`` is only a response safety cap, not a
+    # request for 600 daily candles. Letting it redefine the target would make
+    # 4H/1D charts report "warming" forever after their 30-day fill completed.
+    target_bars = (history_target if since > 0
+                   else max(limit, history_target))
     extent = None
-    if sync:
-        extent = _okx(lambda: market.ensure_candles(store, inst, tf,
-                                                    target_bars=max(limit, 500)))
-        _watch(inst, tf)
+
+    if sync and since == 0:
+        extent = _okx(
+            lambda: market.ensure_candles(
+                store, inst, tf, target_bars=target_bars,
+                max_pages=market.SYNC_MAX_PAGES),
+            label=f"candles {inst} {tf}",
+        )
+
+    # Scheduling every request is intentional: pending/completed keys are
+    # deduplicated, while a transiently failed worker becomes retryable on the
+    # next five-second incremental poll. This remains non-blocking in since mode.
+    market.get_warmer().schedule(store, inst, tf)
+    _watch(inst, tf)
+    oldest, newest, count = store.candle_extent(inst, tf)
+    if extent is None:
+        extent = {"oldest": oldest, "newest": newest, "count": count,
+                  "fetched": 0, "holes_filled": 0}
+    else:
+        # The worker can begin between ensure_candles returning and this read;
+        # publish the current extent rather than a snapshot already behind disk.
+        extent.update({"oldest": oldest, "newest": newest, "count": count})
+    extent.update({"target": target_bars, "warming": count < target_bars})
+
     rows = store.candles(inst, tf, limit=limit)
+    if since > 0:
+        rows = [row for row in rows if int(row["ts"]) >= since]
     return _json_safe({
         "symbol": inst, "bar": tf, "count": len(rows), "extent": extent,
         "rows": [[r["ts"], r["open"], r["high"], r["low"], r["close"],
@@ -484,9 +570,13 @@ def autotrade_set(patch: AutoTradePatch):
             # Backfill once, then let the poller keep it fresh at bar
             # boundaries. Watching is what stops the scan from re-fetching
             # history every 15 seconds for every symbol.
-            _okx(lambda i=inst: market.ensure_candles(store, i, cfg.bar_5m, 400),
+            _okx(lambda i=inst: market.ensure_candles(
+                     store, i, cfg.bar_5m,
+                     market.bars_for_days(cfg.bar_5m)),
                  label=f"candles {inst} 5m")
-            _okx(lambda i=inst: market.ensure_candles(store, i, cfg.bar_15m, 200),
+            _okx(lambda i=inst: market.ensure_candles(
+                     store, i, cfg.bar_15m,
+                     market.bars_for_days(cfg.bar_15m)),
                  label=f"candles {inst} 15m")
             _watch(inst, cfg.bar_5m, pin=True)
             _watch(inst, cfg.bar_15m, pin=True)

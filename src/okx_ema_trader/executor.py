@@ -190,6 +190,13 @@ class Executor:
                          ind_15m["ema_fast"], ind_15m["ema_slow"], ind_15m["adx"]))
         logging.info("%s: %s | held=%s", symbol, detail or "no indicators", booked.side)
 
+        # 交易所已经把仓位打掉了（止损或止盈成交），账本却还记着。挂了止盈之
+        # 后这是正常结局而不是异常：不清账本，这个 symbol 会永远卡在"持有"
+        # 状态，每次反向信号都在 _flip 里因为交易所无仓而抛错。
+        if booked.is_open and self._closed_remotely(symbol):
+            self._settle_remote_close(symbol, booked, ind_15m)
+            return
+
         if signal is None:
             if reason == REASON_NO_CROSS:
                 # The ordinary case: this bar simply had no crossover. Since the
@@ -209,10 +216,61 @@ class Executor:
             logging.debug("%s: %s signal unchanged — no action", symbol, signal.side)
             return
 
+        # 出场后观望：一次 15m 环境翻转会连续几根 5m bar 发出同一方向的信号，
+        # 刚被止盈/止损打掉的那一笔不能再按同一个信号买回来。换一个 15m bar
+        # （= 换了信号身份）才允许重新入场。
+        exit_key = f"{signal.side}:{ind_15m.get('ts')}"
+        if self.ledger.last_exit.get(symbol) == exit_key:
+            logging.info("%s: 出场后观望中（%s）—等下一个新信号", symbol, exit_key)
+            return
+
         logging.info("%s: %s -> %s (%s)", symbol, booked.side, signal.side, signal.reason)
         self._flip(symbol, signal, booked)
 
     # ----------------------------------------------------------------- actions
+    def _closed_remotely(self, symbol: str) -> bool:
+        """交易所确认这个 symbol 已经没有仓位了？
+
+        "确认没有"和"读不到"是两件事，这里必须分开：读不到（网络/代理错误）时
+        返回 False，本轮不动账本——把一个未知状态清成 flat 会让人误以为可以
+        开新仓。只有交易所明确回答"没有"才算数。
+        """
+        if self.dry_run:
+            return False  # 干跑没有真实仓位可问
+        try:
+            return self.broker.get_position(symbol) is None
+        except BrokerError as exc:
+            logging.warning("%s: 读不到交易所持仓（%s）—本轮不动账本", symbol, exc)
+            return False
+
+    def _settle_remote_close(self, symbol: str, booked: Position,
+                             ind_15m: dict) -> None:
+        """交易所已经平掉这一笔：结算盈亏、恢复 flat、记录信号身份。
+
+        恢复 flat 是必须的，不然"止盈后等下一个信号"永远走不到那一步。交易所
+        说没有仓位就是没有，此时开新仓不会叠成双倍——真正危险的是"其实有仓但
+        读成无仓"，那由 _closed_remotely 的异常分支挡住。
+        """
+        try:
+            exit_price = self.broker.price(symbol)
+        except BrokerError as exc:
+            logging.warning("%s: 读不到平仓价（%s），按止损价估算盈亏", symbol, exc)
+            exit_price = booked.stop_price
+
+        pnl = realized_pnl(self.broker, symbol, booked, exit_price)
+        self.ledger.clear(symbol)
+        self.ledger.last_exit[symbol] = f"{booked.side}:{ind_15m.get('ts')}"
+        self.ledger.save()
+
+        logging.warning("%s: 交易所已平仓（止盈/止损成交），按 %.6f 结算", symbol, exit_price)
+        if pnl is None:
+            logging.warning("%s: 这一笔的盈亏算不出来，未计入风控计数", symbol)
+            return
+        # 平仓之后记账，和 _flip 里同样的顺序理由：挡不住的永远是下一笔。
+        decision = self.guard.record_close(pnl)
+        if decision.halted:
+            self._flatten(decision.close_symbols)
+
     def _flatten(self, symbols) -> None:
         """平掉风控点名的仓位。平不掉就继续喊，绝不假装已经平了。"""
         for symbol in symbols:
@@ -293,6 +351,7 @@ class Executor:
             symbol, signal.side, exposure / max(self.trading.leverage, 1),
             effective, self.trading.stop_loss_pct,
             client_id=f"{symbol.split('-')[0]}{int(time.time())}",
+            take_profit_pct=self.trading.take_profit_pct,
         )
         self.ledger.set(symbol, Position(
             side=signal.side,
@@ -302,10 +361,12 @@ class Executor:
             entry_order_id=fill.order_id,
             stop_order_id=fill.stop_order_id,
             stop_price=fill.stop_price,
+            take_profit_price=fill.take_profit_price,
         ))
         self.ledger.save()
-        logging.info("%s: holding %s | entry=%.6f size=%s stop=%.6f",
-                     symbol, signal.side, fill.price, fill.size, fill.stop_price)
+        logging.info("%s: holding %s | entry=%.6f size=%s stop=%.6f tp=%s",
+                     symbol, signal.side, fill.price, fill.size, fill.stop_price,
+                     fill.take_profit_price or "-")
 
 
 def main() -> None:

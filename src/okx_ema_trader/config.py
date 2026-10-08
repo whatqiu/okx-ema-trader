@@ -15,6 +15,8 @@ class TradingConfig:
     equity_pct: float = 0.0
     leverage: int = 1
     stop_loss_pct: float = 3.0
+    # 0 = 只挂止损，不挂止盈。止盈是"到价就走、然后观望"，不是反手。
+    take_profit_pct: float = 0.0
     max_total_notional: float = 300.0
     position_mode: str = "cross"
 
@@ -90,6 +92,7 @@ def load_config(path: str | Path) -> Config:
         equity_pct=float(trading.get("equity_pct", 0.0)),
         leverage=int(trading.get("leverage", 1)),
         stop_loss_pct=float(trading.get("stop_loss_pct", 3.0)),
+        take_profit_pct=float(trading.get("take_profit_pct", 0.0)),
         max_total_notional=float(trading.get("max_total_notional", 300.0)),
         position_mode=str(trading.get("position_mode", "cross")),
     )
@@ -145,6 +148,9 @@ def validate(config: Config) -> None:
         raise ValueError(f"leverage must be between 1 and 125, got {trading.leverage}")
     if not 0 < trading.stop_loss_pct < 100:
         raise ValueError(f"stop_loss_pct must be in (0, 100), got {trading.stop_loss_pct}")
+    if not 0 <= trading.take_profit_pct < 100:
+        raise ValueError(
+            f"take_profit_pct must be in [0, 100) (0 = 不挂止盈), got {trading.take_profit_pct}")
     if trading.max_total_notional <= 0:
         raise ValueError(f"max_total_notional must be > 0, got {trading.max_total_notional}")
     if trading.position_mode not in ("cross", "isolated"):

@@ -83,14 +83,29 @@ class FakeBroker:
         pass
 
     def market_entry(self, symbol: str, side: str, notional_usdt: float,
-                     leverage: int, stop_pct: float, client_id: str | None = None) -> Fill:
+                     leverage: int, stop_pct: float, client_id: str | None = None,
+                     take_profit_pct: float = 0.0) -> Fill:
         self.entered.append((symbol, side))
         size = self.contracts_for_notional(symbol, notional_usdt * leverage, self.price_value)
         stop = self.price_value * (1 - stop_pct / 100) if side == "long" \
             else self.price_value * (1 + stop_pct / 100)
+        tp = 0.0
+        if take_profit_pct > 0:
+            tp = self.price_value * (1 + take_profit_pct / 100) if side == "long" \
+                else self.price_value * (1 - take_profit_pct / 100)
         return Fill(order_id="fake", side=side, price=self.price_value, size=size,
                     notional=self.notional_for_contracts(symbol, size, self.price_value),
-                    stop_price=stop, stop_order_id="fake-stop")
+                    stop_price=stop, stop_order_id="fake-stop", take_profit_price=tp)
+
+
+def _one_stop_equity_pct(config) -> float:
+    """一次止损亏掉的权益%：stop% × leverage × 仓位占比。
+
+    钉住公式而不是数字：config.yaml 一改杠杆或仓位，写死 30.0 的断言就会
+    误报，而真正要防的是"推导漏掉仓位占比"这类错误。
+    """
+    trading = config.trading
+    return trading.stop_loss_pct * trading.leverage * (trading.equity_pct / 100.0)
 
 
 def _setup(equity: float = 1000.0, *, limits: GuardLimits | None = None,
@@ -381,8 +396,8 @@ def test_config_drawdown_limit_is_actually_used() -> None:
 
     limits = GuardLimits.for_trading(config.trading, config.risk)
     assert limits.max_drawdown_pct == 60.0
-    # 省略 max_position_loss_pct -> 自动推导 = stop_loss_pct × leverage = 3 × 10
-    assert limits.max_position_loss_pct == 30.0
+    # 省略 max_position_loss_pct -> 自动推导 = stop% × leverage × 仓位占比
+    assert limits.max_position_loss_pct == _one_stop_equity_pct(config)
     assert limits.max_consecutive_losses == 3
 
     guard, broker, _, _ = _setup(equity=1000.0, limits=limits)
@@ -403,7 +418,7 @@ def test_risk_section_is_optional() -> None:
     limits = GuardLimits.for_trading(config.trading, config.risk)
     assert limits.max_drawdown_pct == 60.0
     assert limits.max_consecutive_losses == 3
-    assert limits.max_position_loss_pct == 30.0
+    assert limits.max_position_loss_pct == _one_stop_equity_pct(config)
 
     # 默认就是 60，不是旧的 30。
     guard, broker, _, _ = _setup(equity=1000.0, limits=limits)
@@ -419,7 +434,7 @@ def test_zero_disables_one_rule_only() -> None:
     assert limits.max_drawdown_pct == 0.0
     # 另外两条没配，仍然走默认值，不受影响。
     assert limits.max_consecutive_losses == 3
-    assert limits.max_position_loss_pct == 30.0
+    assert limits.max_position_loss_pct == _one_stop_equity_pct(config)
 
     guard, broker, _, _ = _setup(equity=1000.0, limits=limits)
     guard.check()
@@ -450,7 +465,7 @@ def test_executor_hands_config_risk_to_the_guard() -> None:
     _, broker, ledger, _ = _setup(equity=1000.0)
     executor = Executor(config, broker, ledger)
     assert executor.guard.limits.max_drawdown_pct == 60.0
-    assert executor.guard.limits.max_position_loss_pct == 30.0
+    assert executor.guard.limits.max_position_loss_pct == _one_stop_equity_pct(config)
 
 
 def main() -> int:
