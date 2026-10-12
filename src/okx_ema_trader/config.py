@@ -53,6 +53,13 @@ class Config:
     adx_min: float
     # 15m 偏离度上限：abs(close - EMA20) / EMA20，超过则不允许新开仓。
     deviation_max: float
+    # 5m 触发方式。"crossover" = EMA20/50 交叉（事件）；"pullback" = 回调
+    # 触及 5m 快速均线（状态，需要闩锁）。回调在 31 天实测里 gross 转正但
+    # 换手高 5 倍，breakeven 7.3 bps 低于真实 8 bps 成本，净收益仍为负 ——
+    # 见 README 与 tools/test_pullback.py。默认保持 crossover。
+    entry_mode: str
+    # 仅 entry_mode="pullback" 时生效：多接近快速均线算"触及"，小数。
+    pullback_tolerance: float
     reconnect_seconds: int
     log_level: str
     trading: TradingConfig = field(default_factory=TradingConfig)
@@ -110,6 +117,8 @@ def load_config(path: str | Path) -> Config:
         ema_slow=int(strategy["ema_slow"]), adx_period=int(strategy["adx_period"]),
         adx_min=float(strategy["adx_min"]),
         deviation_max=float(strategy.get("deviation_max", 0.02)),
+        entry_mode=str(strategy.get("entry_mode", "crossover")),
+        pullback_tolerance=float(strategy.get("pullback_tolerance", 0.002)),
         reconnect_seconds=int(runtime["reconnect_seconds"]),
         log_level=runtime["log_level"], trading=trading_config, risk=risk_config,
     )
@@ -127,6 +136,15 @@ def validate(config: Config) -> None:
         raise ValueError(f"adx_period must be >= 2, got {config.adx_period}")
     if config.deviation_max <= 0:
         raise ValueError(f"deviation_max must be > 0, got {config.deviation_max}")
+    if config.entry_mode not in ("crossover", "pullback"):
+        raise ValueError(
+            f"entry_mode must be 'crossover' or 'pullback', got {config.entry_mode!r}")
+    if not 0 < config.pullback_tolerance < 0.1:
+        # A zero tolerance never triggers (price is never exactly on the EMA);
+        # a huge one fires on almost every bar, which is the cost blow-up the
+        # measured breakeven already demonstrated.
+        raise ValueError(
+            f"pullback_tolerance must be in (0, 0.1), got {config.pullback_tolerance}")
     if config.candle_limit < max(config.ema_slow, config.adx_period * 2):
         raise ValueError(
             f"candle_limit ({config.candle_limit}) is below the indicator warm-up "

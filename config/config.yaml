@@ -13,6 +13,19 @@ strategy:
   # 15m 偏离度过滤：abs(close - EMA20) / EMA20 <= deviation_max 才允许新开仓。
   # 只作用于 15m，只作为入场过滤，不影响已持有的仓位。
   deviation_max: 0.02
+  # 5m 触发方式：
+  #   crossover（默认）= EMA20/50 交叉，是一个"事件"，只在那一根触发
+  #   pullback         = 回调触及 5m 快速均线，是一个"状态"，需要闩锁
+  #
+  # 实测结论（31 天真实 K 线 × 5 币种，tools/test_pullback.py）：回调的
+  # 毛收益转正（−72.6% → +29.3%），但换手从 72 涨到 201 笔，每单位盈亏平衡
+  # 成本只有 7.3 bps，低于真实约 8 bps —— 净收益 −2.9%，5 个 tolerance 值
+  # 全部为负。所以它是一个可测量、可切换的选项，**不是**一个改进。
+  # 想自己复现结论：python tools/test_pullback.py
+  entry_mode: crossover
+  # 仅 entry_mode: pullback 时生效。多接近快速均线算"触及"，必须 > 0
+  # （等于 0 时价格几乎不会正好落在均线上，等于永不触发）。
+  pullback_tolerance: 0.002
 
 runtime:
   reconnect_seconds: 5

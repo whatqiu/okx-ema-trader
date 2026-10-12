@@ -341,6 +341,8 @@ def simulate(
         signal = evaluate_signal(
             {
                 "close": float(row_5m["close"]),
+                "high": float(row_5m["high"]),
+                "low": float(row_5m["low"]),
                 "ema_fast": float(row_5m["ema_fast"]),
                 "ema_slow": float(row_5m["ema_slow"]),
                 "prev_ema_fast": float(prev_5m["ema_fast"]),

@@ -34,6 +34,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from okx_ema_trader import backtest  # noqa: E402
 from okx_ema_trader.backtest import simulate  # noqa: E402
 from okx_ema_trader.config import load_config  # noqa: E402
 from okx_ema_trader.indicators import indicator_frame  # noqa: E402
@@ -71,15 +72,28 @@ def load_candles(conn, inst: str, bar: str) -> list[list[float]]:
     return [seen[k] for k in sorted(seen)]
 
 
-def run(inst: str, conn, cfg, stop_pct: float, cost_bps: float) -> dict | None:
+def run(inst: str, conn, cfg, stop_pct: float, cost_bps: float,
+        entry=None) -> dict | None:
     c5 = load_candles(conn, inst, "5m")
     c15 = load_candles(conn, inst, "15m")
     if len(c5) < 200 or len(c15) < 200:
         return None
     f5 = indicator_frame(c5, cfg.ema_fast, cfg.ema_slow, cfg.adx_period)
     f15 = indicator_frame(c15, cfg.ema_fast, cfg.ema_slow, cfg.adx_period)
-    rep = simulate(f5, f15, cfg.adx_min, cfg.deviation_max,
-                   cost_bps, LOOKAHEAD_MS, stop_pct)
+    if entry is None:
+        rep = simulate(f5, f15, cfg.adx_min, cfg.deviation_max,
+                       cost_bps, LOOKAHEAD_MS, stop_pct)
+    else:
+        # Swap the entry rule ONLY. Everything else — fills, costs, the stop,
+        # the 15m environment — is the same code, so a difference in the result
+        # is a difference in the entry and not in the harness.
+        original = backtest.evaluate_signal
+        backtest.evaluate_signal = entry
+        try:
+            rep = simulate(f5, f15, cfg.adx_min, cfg.deviation_max,
+                           cost_bps, LOOKAHEAD_MS, stop_pct)
+        finally:
+            backtest.evaluate_signal = original
     return _stats(inst, rep, stop_pct, cost_bps)
 
 
@@ -151,6 +165,10 @@ def main() -> None:
     ap.add_argument("--split", action="store_true",
                     help="also run the first 60%% of each series as in-sample "
                          "and the remainder as out-of-sample")
+    ap.add_argument("--entry", choices=("crossover", "pullback"),
+                    default="crossover",
+                    help="5m trigger: a crossover event (default) or a pullback "
+                         "into the fast EMA (a state; costs ~5x the turnover)")
     args = ap.parse_args()
 
     if not DB.exists():
@@ -160,9 +178,18 @@ def main() -> None:
     stop = args.stop_pct if args.stop_pct is not None else cfg.trading.stop_loss_pct
     conn = sqlite3.connect(DB)
 
+    # A pullback rule carries a latch, so it must be ONE instance reused across
+    # the whole run. Building it per-symbol would re-arm at every boundary and
+    # turn a single dip into several entries.
+    entry = None
+    if args.entry == "pullback":
+        from okx_ema_trader.strategy import PullbackEntry
+        entry = PullbackEntry(tolerance=cfg.pullback_tolerance)
+
     symbols = [r[0] for r in conn.execute(
         "SELECT DISTINCT inst_id FROM candles WHERE bar='5m' AND confirm=1")]
-    rows = [s for s in (run(i, conn, cfg, stop, COST_BPS) for i in symbols) if s]
+    rows = [s for s in (run(i, conn, cfg, stop, COST_BPS, entry)
+                        for i in symbols) if s]
     if not rows:
         raise SystemExit("not enough stored history to evaluate anything")
     rows.sort(key=lambda s: -s["n"])
@@ -179,7 +206,7 @@ def main() -> None:
     # minus gross — subtracting the two gross columns yields a column of zeros
     # that looks like a finding.
     gross_only = {s["inst"]: s for s in
-                  (run(i, conn, cfg, stop, 0.0) for i in symbols) if s}
+                  (run(i, conn, cfg, stop, 0.0, entry) for i in symbols) if s}
     print(f"  {'symbol':<16}{'trades':>7}{'gross@0cost':>14}{'net@8cost':>12}"
           f"{'cost drag':>12}")
     # Keyed by symbol, not zipped: `rows` is sorted by trade count and
@@ -212,8 +239,25 @@ def main() -> None:
                     continue
                 f5 = indicator_frame(a, cfg.ema_fast, cfg.ema_slow, cfg.adx_period)
                 f15 = indicator_frame(b, cfg.ema_fast, cfg.ema_slow, cfg.adx_period)
-                rep = simulate(f5, f15, cfg.adx_min, cfg.deviation_max,
-                               COST_BPS, LOOKAHEAD_MS, stop)
+                if entry is None:
+                    rep = simulate(f5, f15, cfg.adx_min, cfg.deviation_max,
+                                   COST_BPS, LOOKAHEAD_MS, stop)
+                else:
+                    # The latch must NOT be shared between the in-sample and
+                    # out-sample halves: it would be disarmed by the end of the
+                    # first half and then stay disarmed, which is a state leak
+                    # across a boundary that exists only to make the number
+                    # comparable. Fresh rule per half; the ENTRY logic is
+                    # identical either way.
+                    original = backtest.evaluate_signal
+                    from okx_ema_trader.strategy import PullbackEntry
+                    backtest.evaluate_signal = PullbackEntry(
+                        tolerance=cfg.pullback_tolerance)
+                    try:
+                        rep = simulate(f5, f15, cfg.adx_min, cfg.deviation_max,
+                                       COST_BPS, LOOKAHEAD_MS, stop)
+                    finally:
+                        backtest.evaluate_signal = original
                 s = _stats(inst, rep, stop, COST_BPS)
                 print(f"  {inst:<16}{label:<12}{s['n']:>5} trades  "
                       f"net={s['net']:>+8.2%}  breakeven={s['breakeven']:>7.1f}b  "

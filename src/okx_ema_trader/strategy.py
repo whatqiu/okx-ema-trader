@@ -33,13 +33,17 @@ class Signal:
     reason: str
 
 
-def classify(ind_5m: dict, ind_15m: dict, adx_min: float,
-             deviation_max: float = 1.0) -> tuple[Signal | None, str]:
-    """Return (signal, reason). `reason` is why there is no signal, else the side.
+def classify_env(ind_5m: dict, ind_15m: dict, adx_min: float,
+                 deviation_max: float = 1.0) -> tuple[Signal | None, str]:
+    """The 15m half of the decision: is a trade ALLOWED, and in which direction.
 
-    `deviation_max` defaults to 1.0 (= 100%, effectively off) so a caller that
-    has not been given a threshold still works, but config always supplies the
-    real one.
+    Split out of `classify` so an alternative entry (a pullback into the fast
+    EMA, say) can share the exact same environment rules instead of copying
+    them. Two copies of "what counts as a trend" is how two strategies end up
+    sharing a name but disagreeing about what a trend is.
+
+    Returns (signal carrying the permitted side, reason). No signal means the
+    environment forbids trading right now.
     """
     if not ind_5m or not ind_15m:
         return None, REASON_WARMUP
@@ -64,6 +68,22 @@ def classify(ind_5m: dict, ind_15m: dict, adx_min: float,
         deviation = abs(ind_15m["close"] - fast_15m) / fast_15m
         if deviation > deviation_max:
             return None, REASON_DEVIATION
+
+    return Signal(env, f"15m {env}"), env
+
+
+def classify(ind_5m: dict, ind_15m: dict, adx_min: float,
+             deviation_max: float = 1.0) -> tuple[Signal | None, str]:
+    """Return (signal, reason). `reason` is why there is no signal, else the side.
+
+    `deviation_max` defaults to 1.0 (= 100%, effectively off) so a caller that
+    has not been given a threshold still works, but config always supplies the
+    real one.
+    """
+    allowed, reason = classify_env(ind_5m, ind_15m, adx_min, deviation_max)
+    if allowed is None:
+        return None, reason
+    env = allowed.side
 
     # --- 5m entry trigger. Must be a crossover that just happened.
     prev_fast = ind_5m.get("prev_ema_fast")
@@ -102,3 +122,90 @@ def evaluate_signal(ind_5m: dict, ind_15m: dict, adx_min: float,
                     deviation_max: float = 1.0) -> Signal | None:
     signal, _ = classify(ind_5m, ind_15m, adx_min, deviation_max)
     return signal
+
+
+def evaluate_env(ind_5m: dict, ind_15m: dict, adx_min: float,
+                 deviation_max: float = 1.0) -> Signal | None:
+    """The permitted side from the 15m environment alone, or None.
+
+    Exposed for entry rules that are not crossover events — a pullback, a limit
+    touch, a range boundary. They must not re-derive "is this a trend"; they
+    call this and add only their own trigger.
+    """
+    signal, _ = classify_env(ind_5m, ind_15m, adx_min, deviation_max)
+    return signal
+
+
+@dataclass
+class PullbackEntry:
+    """Enter on a dip INTO the fast EMA instead of on a crossover.
+
+    The environment is untouched — `evaluate_env` decides the side, exactly as
+    for the crossover rule. Only the trigger differs:
+
+        crossover : a 5m EMA20/50 cross that just happened   (an EVENT)
+        pullback  : price came back to touch the 5m fast EMA (a STATE)
+
+    Because that is a state and not an event, it needs a latch. Without one,
+    every bar of an established trend re-enters, and the cost of that is not
+    theoretical: measured on 31 days x 5 symbols this rule trades ~5x more than
+    the crossover and its `breakeven_bps` (7.3 at tolerance=0.002) sits BELOW a
+    realistic 8 bps cost. It is offered as a measurable, switchable option, not
+    as an improvement — see tools/test_pullback.py for the numbers and
+    README for what they mean.
+
+    `tolerance` is how close to the fast EMA counts as touching it, as a
+    fraction. A wider band trades more often and enters earlier.
+
+    The latch re-arms only when a bar closes back on the far side of the fast
+    EMA, so a single dip produces exactly one entry rather than one per bar
+    while price hovers at the line.
+    """
+
+    tolerance: float = 0.002
+    armed: bool = True          # per-side latch; see class docstring
+
+    def reset(self) -> None:
+        self.armed = True
+
+    def __call__(self, ind_5m: dict, ind_15m: dict, adx_min: float,
+                 deviation_max: float = 1.0) -> Signal | None:
+        allowed = evaluate_env(ind_5m, ind_15m, adx_min, deviation_max)
+        if allowed is None:
+            # Environment forbids the trade. Reset the latch, so a later trend
+            # is allowed to fire immediately instead of waiting for a reset bar.
+            self.reset()
+            return None
+
+        side = allowed.side
+        close = ind_5m["close"]
+        fast = ind_5m["ema_fast"]
+        band = self.tolerance
+        if side == "long":
+            # The band is TWO-SIDED and the trigger is `low` REACHING it from
+            # above. Testing only `low <= fast * (1 + tol)` looks right and is
+            # not: in a long trend price is below the fast EMA most of the
+            # time, so that condition is true on nearly every bar and `tolerance`
+            # does nothing at all — a 10% crash counted as a "dip into the EMA".
+            # Requiring `low` to stay at or ABOVE the lower edge is what makes
+            # this a pullback instead of "we are long, so any bar will do".
+            near = fast * (1 - band)
+            reached = ind_5m.get("low", close) <= fast * (1 + band)
+            held = ind_5m.get("low", close) >= near
+            reset = close > fast * (1 + band)
+        else:
+            near = fast * (1 + band)
+            reached = ind_5m.get("high", close) >= fast * (1 - band)
+            held = ind_5m.get("high", close) <= near
+            reset = close < fast * (1 - band)
+
+        # Order matters. A bar whose wick reached the band but whose CLOSE came
+        # back the other way satisfies both `reached` and `reset`; re-arming
+        # first would let that single bar fire an entry, which is exactly the
+        # repeat the latch exists to prevent.
+        if self.armed and reached and held:
+            self.armed = False
+            return Signal(side, f"15m {side} + 5m pullback into EMA")
+        if reset:
+            self.reset()
+        return None

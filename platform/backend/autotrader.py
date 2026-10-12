@@ -37,9 +37,33 @@ import market
 import paper
 from okx_ema_trader.backtest import MINUTES_PER_BAR
 from okx_ema_trader.indicators import indicator_frame
-from okx_ema_trader.strategy import evaluate_signal
+from okx_ema_trader.strategy import PullbackEntry, evaluate_signal
 
 _DEFAULTS = {"enabled": "0", "symbol": "", "notional": "100", "leverage": "5"}
+
+# Pullback entries are STATEFUL (see strategy.PullbackEntry): the latch lives
+# across scans, so one instance per symbol for the life of the process. A fresh
+# instance per scan would re-arm every 15s and fire on the same dip repeatedly —
+# the exact behaviour the latch exists to prevent, and it would show up only as
+# an inexplicable jump in trade count.
+_entry_rules: dict[str, object] = {}
+
+
+def _entry_rule(inst_id: str = ""):
+    """Return this symbol's entry rule, honouring `entry_mode` in config."""
+    cfg = deps.config()
+    if cfg.entry_mode != "pullback":
+        return evaluate_signal
+    rule = _entry_rules.get(inst_id)
+    if rule is None:
+        rule = PullbackEntry(tolerance=cfg.pullback_tolerance)
+        _entry_rules[inst_id] = rule
+    return rule
+
+
+def reset_entry_rules() -> None:
+    """Drop cached latches. Test hook: module state must not leak between cases."""
+    _entry_rules.clear()
 
 # A watch list is not a portfolio: beyond this the scan spends more on API
 # calls and candle backfill than it gains from extra signal opportunities.
@@ -208,7 +232,7 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
     opposite position is allowed under both: reducing risk never needs
     permission.
     """
-    signal_fn = signal_fn or evaluate_signal
+    signal_fn = signal_fn or _entry_rule(inst_id)
     cfg = deps.config()
     bar5 = cfg.bar_5m
     bar15 = cfg.bar_15m
@@ -290,7 +314,9 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
         ind_15m["prev_ema_fast"] = float(p15["ema_fast"])
         ind_15m["prev_ema_slow"] = float(p15["ema_slow"])
     signal = signal_fn(
-        {"close": float(r5["close"]), "ema_fast": float(r5["ema_fast"]),
+        {"close": float(r5["close"]), "high": float(r5["high"]),
+         "low": float(r5["low"]),
+         "ema_fast": float(r5["ema_fast"]),
          "ema_slow": float(r5["ema_slow"]),
          "prev_ema_fast": float(p5["ema_fast"]),
          "prev_ema_slow": float(p5["ema_slow"])},

@@ -40,7 +40,8 @@ from .indicators import calculate_indicators
 from .risk_guard import GuardLimits, RiskGuard, realized_pnl
 from .state import Ledger, Position, RiskState, StateError
 from .strategy import (REASON_ADX, REASON_DEVIATION, REASON_NO_CROSS,
-                       REASON_NO_ENV, REASON_WARMUP, Signal, classify)
+                       REASON_NO_ENV, REASON_WARMUP, PullbackEntry, Signal,
+                       classify)
 
 ROOT = Path(__file__).parents[2]
 CONFIG_PATH = ROOT / "config" / "config.yaml"
@@ -100,6 +101,12 @@ class Executor:
         # stop_loss_pct × leverage 推导。
         self.guard = RiskGuard(GuardLimits.for_trading(self.trading, config.risk),
                                broker, ledger)
+        # The entry rule is stateful when it is not the default: a pullback is a
+        # STATE, not an event, so it needs its latch carried across loops. One
+        # instance per Executor (not per call) or it would fire on every loop.
+        self._entry: Callable | None = None
+        if config.entry_mode == "pullback":
+            self._entry = PullbackEntry(tolerance=config.pullback_tolerance)
 
     # ------------------------------------------------------------ startup gate
     def reconcile(self) -> None:
@@ -173,8 +180,18 @@ class Executor:
         ind_15m = calculate_indicators(series_15m, self.config.ema_fast,
                                        self.config.ema_slow, self.config.adx_period)
 
-        signal, reason = _classify(ind_5m, ind_15m, self.config.adx_min,
-                                   self.config.deviation_max)
+        if self._entry is None:
+            signal, reason = _classify(ind_5m, ind_15m, self.config.adx_min,
+                                       self.config.deviation_max)
+        else:
+            # The latch means "no signal" here is not always "no signal" — it
+            # can also mean "already fired on this dip". REASON_NO_ENV is the
+            # honest label either way the UI reads it, and the latched state is
+            # an entry-rule detail, not a market condition.
+            hit = self._entry(ind_5m, ind_15m, self.config.adx_min,
+                              self.config.deviation_max)
+            signal = hit
+            reason = hit.side if hit else REASON_NO_CROSS
         booked = self.ledger.get(symbol)
 
         if reason == REASON_WARMUP:

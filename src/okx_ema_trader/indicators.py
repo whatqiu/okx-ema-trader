@@ -95,6 +95,12 @@ def calculate_indicators(candles: list[list[float]], ema_fast: int, ema_slow: in
     return {
         "ts": int(row["ts"]),
         "close": float(row["close"]),
+        # `high` / `low` are here because a pullback entry triggers on the bar's
+        # RANGE touching the fast EMA, not on its close: a long whose low poked
+        # the EMA and recovered is a dip that was bought, and a close-only view
+        # cannot see it. The crossover rule ignores both keys.
+        "high": float(row["high"]),
+        "low": float(row["low"]),
         "ema_fast": float(row["ema_fast"]),
         "ema_slow": float(row["ema_slow"]),
         "adx": float(row["adx"]),
