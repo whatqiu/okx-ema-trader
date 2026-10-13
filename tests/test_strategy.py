@@ -40,6 +40,56 @@ def _i15(fast, slow, adx, close) -> dict:
     return {"close": close, "ema_fast": fast, "ema_slow": slow, "adx": adx}
 
 
+def _i15_prev(fast, slow, prev_fast, prev_slow, adx=30.0, close=None) -> dict:
+    """15m WITH its previous bar's EMAs.
+
+    `_i15` deliberately omits `prev_ema_fast`, which means every caller of it
+    makes `classify`'s environment-flip branch unreachable. That is how a
+    NameError lived in that branch through a fully green suite: nothing had
+    ever executed it. Anything testing the flip must go through here.
+    """
+    return {"close": close if close is not None else fast,
+            "ema_fast": fast, "ema_slow": slow, "adx": adx,
+            "prev_ema_fast": prev_fast, "prev_ema_slow": prev_slow}
+
+
+def test_env_flip_to_short_fires_without_a_5m_crossover():
+    """15m turning bearish IS an event; the 5m cross has already faded by then.
+
+    The 5m pair here is deliberately mid-death-cross rather than freshly
+    crossed: if this ever fires, the flip branch executed instead of the
+    crossover branch two lines above it.
+    """
+    i15 = _i15_prev(99.0, 100.0, 100.5, 100.0, adx=30.0)
+    # prev_fast < prev_slow, so `env == "short"` and the death-cross test
+    # (prev_fast >= prev_slow) is false -> no crossover on this bar.
+    i5 = _i5(98.5, 99.5, 99.0, 99.5, close=98.5)
+    signal = evaluate_signal(i5, i15, ADX_MIN, DEV_MAX)
+    assert signal is not None, "15m env flip to bearish must produce a signal"
+    assert signal.side == "short", f"flip must short, got {signal}"
+    assert "flipped bearish" in signal.reason, f"wrong reason: {signal.reason}"
+
+
+def test_env_flip_to_long_fires_without_a_5m_crossover():
+    i15 = _i15_prev(101.0, 100.0, 99.5, 100.0, adx=30.0)
+    i5 = _i5(101.5, 100.5, 101.0, 100.5, close=101.5)
+    signal = evaluate_signal(i5, i15, ADX_MIN, DEV_MAX)
+    assert signal is not None, "15m env flip to bullish must produce a signal"
+    assert signal.side == "long", f"flip must long, got {signal}"
+    assert "flipped bullish" in signal.reason, f"wrong reason: {signal.reason}"
+
+
+def test_no_flip_no_prev_ema_still_reports_no_cross():
+    """Without previous 15m EMAs the flip is unknowable -> plain no-cross.
+
+    Pins that the fix did not turn a missing previous bar into a signal.
+    """
+    i15 = _i15(99.0, 100.0, 30.0, 99.0)          # no prev_ema_* at all
+    i5 = _i5(98.5, 99.5, 99.0, 99.5, close=98.5)
+    assert evaluate_signal(i5, i15, ADX_MIN, DEV_MAX) is None, (
+        "with no previous 15m bar there is no flip to detect")
+
+
 # --------------------------------------------------------------------------
 # Entry is an event
 # --------------------------------------------------------------------------

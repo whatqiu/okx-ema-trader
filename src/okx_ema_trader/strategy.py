@@ -99,15 +99,22 @@ def classify(ind_5m: dict, ind_15m: dict, adx_min: float,
     if env == "short" and prev_fast >= prev_slow and fast_5m < slow_5m:
         return Signal("short", "15m bearish + 5m death cross"), "short"
 
-    # A 15m ENVIRONMENT FLIP is itself an event, and unlike the 5m crossover it
+    # 15m ENVIRONMENT FLIP is itself an event, and unlike the 5m crossover it
     # is guaranteed to fire at the same bar the environment turns. Without this
     # branch the two conditions above can never both hold on a reversal: by the
     # time the slower 15m EMAs have crossed, the 5m crossover has already faded
     # into a state, so no opposite signal is ever produced and an open position
     # is held until its stop. 5m alignment here is only a "don't fight it"
     # confirmation, not the trigger.
+    #
+    # Read the values off `ind_15m` again rather than reusing a name from
+    # `classify_env`: those are locals of that function and are NOT visible
+    # here. Referring to them looked fine and raised NameError at runtime, on
+    # exactly the bar a reversal fires — the branch no test had ever entered.
     prev_fast_15m = ind_15m.get("prev_ema_fast")
     prev_slow_15m = ind_15m.get("prev_ema_slow")
+    fast_15m = ind_15m["ema_fast"]
+    slow_15m = ind_15m["ema_slow"]
     if prev_fast_15m is not None and prev_slow_15m is not None:
         if prev_fast_15m >= prev_slow_15m and fast_15m < slow_15m and fast_5m < slow_5m:
             return Signal("short", "15m env flipped bearish + 5m aligned"), "short"
