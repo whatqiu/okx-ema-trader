@@ -255,12 +255,29 @@ def test_config_values() -> int:
     # Risk parameters must be untouched. These are the numbers the account is
     # actually risked on, so pinning them is the point: a stray edit to leverage
     # or stop distance silently changes what one losing trade costs.
-    if config.trading.leverage != 25 or config.trading.equity_pct != 20.0 \
+    #
+    # 2026-10-14 recalibrated from the real account history (37 trades): the
+    # shipped numbers are risk sizing at 1% per trade with no take-profit.
+    # leverage 25->20 because 50x was provably unusable (stop distance == the
+    # liquidation distance — see tests/test_risk_sizing.py) and take_profit
+    # 2.0->0 because winning trades had a median MFE of only 1.65%, so a 2%
+    # take-profit truncates the right tail. equity_pct stays for the other
+    # sizing modes; sizing_mode: risk makes it inert.
+    from okx_ema_trader.config import account_risk_per_trade_pct
+    if config.trading.leverage != 20 or config.trading.sizing_mode != "risk" \
+            or config.trading.risk_per_trade_pct != 1.0 \
             or config.trading.stop_loss_pct != 2.0 \
-            or config.trading.take_profit_pct != 2.0:
+            or config.trading.take_profit_pct != 0.0:
         print("  FAIL risk parameters changed: "
-              f"lev={config.trading.leverage} eq={config.trading.equity_pct} "
+              f"mode={config.trading.sizing_mode} lev={config.trading.leverage} "
+              f"risk%={config.trading.risk_per_trade_pct} "
               f"stop={config.trading.stop_loss_pct} tp={config.trading.take_profit_pct}")
+        failures += 1
+    # Pin the derived number too: it is what one losing trade actually costs,
+    # and a 20x stop edit that looked harmless would move it.
+    if abs(account_risk_per_trade_pct(config.trading) - 1.0) > 1e-12:
+        print("  FAIL one stop should risk 1% of equity, got "
+              f"{account_risk_per_trade_pct(config.trading)}")
         failures += 1
     # The circuit-breaker limits live in config now, so they are just as easy to
     # change by accident as leverage is — and a stray edit here silently moves
@@ -269,8 +286,12 @@ def test_config_values() -> int:
         print(f"  FAIL risk.max_drawdown_pct should be 60, "
               f"got {config.risk.max_drawdown_pct}")
         failures += 1
-    if config.risk.max_consecutive_losses != 3:
-        print(f"  FAIL risk.max_consecutive_losses should be 3, "
+    # 3 -> 5 on 2026-10-14. At 1% per trade, halting on 3 losses stops the bot
+    # after -3% of equity, and the measured 57% win rate makes three consecutive
+    # losses an 8.0% event — 91.7% likely to appear somewhere in 30 trades. That
+    # is "unlucky", not "broken"; 5 in a row is a 1.7% event.
+    if config.risk.max_consecutive_losses != 5:
+        print(f"  FAIL risk.max_consecutive_losses should be 5, "
               f"got {config.risk.max_consecutive_losses}")
         failures += 1
     # Left unset on purpose: one stop-out costs stop_loss_pct x leverage = 30%,

@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from okx_ema_trader import executor as executor_module
 from okx_ema_trader.broker import Fill
-from okx_ema_trader.config import load_config
+from okx_ema_trader.config import account_risk_per_trade_pct, load_config
 from okx_ema_trader.executor import Executor
 from okx_ema_trader.risk_guard import GuardLimits, RiskGuard
 from okx_ema_trader.state import Ledger, Position, StateError
@@ -99,13 +99,16 @@ class FakeBroker:
 
 
 def _one_stop_equity_pct(config) -> float:
-    """一次止损亏掉的权益%：stop% × leverage × 仓位占比。
+    """一次止损亏掉的权益%，直接取生产代码的推导。
 
-    钉住公式而不是数字：config.yaml 一改杠杆或仓位，写死 30.0 的断言就会
-    误报，而真正要防的是"推导漏掉仓位占比"这类错误。
+    之前这里是本地重算 `stop × leverage × equity_pct`——而生产代码自己也在
+    算同一个东西。两处公式迟早漂移：`sizing_mode: risk` 加进来之后，本地那份
+    算出 8%、生产那份算出 1%，测试报的却是"生产代码错了"。
+
+    钉公式的职责已经交给 `account_risk_per_trade_pct` 自己（见
+    tests/test_risk_sizing.py）；这里要验证的是"熔断用的就是这个值"。
     """
-    trading = config.trading
-    return trading.stop_loss_pct * trading.leverage * (trading.equity_pct / 100.0)
+    return account_risk_per_trade_pct(config.trading)
 
 
 def _setup(equity: float = 1000.0, *, limits: GuardLimits | None = None,

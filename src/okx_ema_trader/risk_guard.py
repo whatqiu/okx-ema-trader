@@ -42,7 +42,7 @@ import logging
 from dataclasses import dataclass
 
 from .broker import BrokerError
-from .config import RiskConfig, TradingConfig
+from .config import RiskConfig, TradingConfig, account_risk_per_trade_pct
 from .state import Ledger, Position, RiskState
 
 log = logging.getLogger(__name__)
@@ -70,21 +70,17 @@ class GuardLimits:
                     risk: RiskConfig | None = None) -> "GuardLimits":
         """按实际暴露推导阈值；config 里显式配了就以 config 为准。
 
-        单仓阈值默认跟着配置走：一次止损亏掉的权益 = stop_loss_pct × leverage
-        × 仓位占比（3% × 10x × 满仓 = 30%）。写死 30 在 1% × 2x 的配置下等于
-        十五次止损都拦不住。上限压到 90：一个仓位最多亏掉全部权益，超过 100%
-        的阈值永远触发不了，那是静默失效，不是宽松。
-
-        仓位占比这一项不能省：equity_pct=20 时一次止损只亏 3% × 10 × 0.2 = 6%
-        权益，漏掉 0.2 就把阈值抬到 30%——五倍，熔断在真正该刹车时不刹车。
-        fixed 模式没有 equity 可参照，只能按"名义就是全部"算，这是已知的高估。
+        单仓阈值跟着"一次止损亏掉多少权益"走，而不是重新算一遍：
+        `account_risk_per_trade_pct()` 把三种 sizing 模式统一成这一个数，
+        `risk` 模式下杠杆本来就被约掉了，不需要再乘仓位占比。上限压到 90：
+        一个仓位最多亏掉全部权益，超过 100% 的阈值永远触发不了，那是静默失效，
+        不是宽松。写死 30 在 1% × 2x 的配置下等于十五次止损都拦不住。
 
         None（没配）和 0（配了但关掉）必须区分，所以只在 is not None 时覆盖
         ——写 0 得真的能把这一条关掉。
         """
         defaults = cls()
-        share = (trading.equity_pct / 100.0) if trading.sizing_mode == "equity" else 1.0
-        one_stop = min(trading.stop_loss_pct * trading.leverage * share, 90.0)
+        one_stop = min(account_risk_per_trade_pct(trading), 90.0)
         return cls(
             max_drawdown_pct=defaults.max_drawdown_pct
             if risk is None or risk.max_drawdown_pct is None else risk.max_drawdown_pct,

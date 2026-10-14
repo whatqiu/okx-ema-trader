@@ -76,10 +76,25 @@ def seconds_until_next_bar() -> float:
 def exposure_for(trading: TradingConfig, equity: float) -> float:
     """Position value in quote currency, before lot rounding.
 
-    Leverage scales the exposure in BOTH modes, so `fixed: 100 @ 10x` risks 1000
-    USDT of notional and `equity: 100% @ 10x` risks the entire account ten times
-    over. That is the definition the CLI flags advertise.
+    Leverage scales the exposure in BOTH "fixed" and "equity" modes, so
+    `fixed: 100 @ 10x` risks 1000 USDT of notional and `equity: 100% @ 10x`
+    risks the entire account ten times over.
+
+    "risk" mode inverts that relationship on purpose. There the size comes
+    from how much of the account the stop is allowed to lose:
+
+        loss_at_stop = exposure x stop_loss_pct/100 = equity x risk_pct/100
+        => exposure  = equity x risk_pct / stop_loss_pct
+
+    Leverage drops out. That is the whole reason the mode exists: at 50x the
+    same 1% account risk still means the same position, because the stop
+    percentage is measured against price, not against margin. Higher leverage
+    only changes how much margin the position consumes, so `max_total_notional`
+    and the margin check below still bound the footprint.
     """
+    if trading.sizing_mode == "risk":
+        return equity * (trading.risk_per_trade_pct / 100.0) / (
+            trading.stop_loss_pct / 100.0)
     if trading.sizing_mode == "equity":
         return equity * (trading.equity_pct / 100.0) * trading.leverage
     return trading.notional_usdt * trading.leverage

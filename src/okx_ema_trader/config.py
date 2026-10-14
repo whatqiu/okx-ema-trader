@@ -9,10 +9,15 @@ class TradingConfig:
 
     enabled: bool = False
     symbols: tuple[str, ...] = ("BTC-USDT-SWAP", "AAVE-USDT-SWAP")
-    # "fixed" = a flat USDT notional per entry; "equity" = a share of account equity.
+    # "fixed" = a flat USDT notional per entry; "equity" = a share of account equity;
+    # "risk"   = size the position from a fixed fraction of equity lost AT THE STOP.
     sizing_mode: str = "fixed"
     notional_usdt: float = 100.0
     equity_pct: float = 0.0
+    # sizing_mode="risk" only: how much of the account one entry may lose if the
+    # stop is hit (percent). This is the number to think about — not leverage,
+    # not equity_pct. See validate() for why the other two are not.
+    risk_per_trade_pct: float = 1.0
     leverage: int = 1
     stop_loss_pct: float = 3.0
     # 0 = 只挂止损，不挂止盈。止盈是"到价就走、然后观望"，不是反手。
@@ -72,6 +77,34 @@ def _optional(raw: dict, key: str, cast) -> object:
     return None if value is None else cast(value)
 
 
+def liquidation_distance_pct(leverage: int) -> float:
+    """Approximate liquidation distance in percent, ignoring maintenance margin.
+
+    Deliberately optimistic: it reports 100/leverage with no maintenance-margin
+    cushion, so it overstates how far a position can move before liquidation.
+    A stop validated against this number is safe; it is not the tightest bound
+    available (the account's real MMR would give a smaller one).
+    """
+    return 100.0 / max(leverage, 1)
+
+
+def account_risk_per_trade_pct(trading: TradingConfig) -> float:
+    """Percent of equity one entry loses if its stop is filled.
+
+    The single number that decides whether a configuration is survivable, and
+    the one every other setting is subordinate to:
+
+        stop_loss_pct x leverage x (share of equity committed)
+
+    In "risk" sizing the product is exactly `risk_per_trade_pct` by
+    construction — leverage cancels out, which is the point of that mode.
+    """
+    if trading.sizing_mode == "risk":
+        return trading.risk_per_trade_pct
+    share = (trading.equity_pct / 100.0) if trading.sizing_mode == "equity" else 1.0
+    return trading.stop_loss_pct * trading.leverage * share
+
+
 def load_config(path: str | Path) -> Config:
     with Path(path).open("r", encoding="utf-8") as file:
         raw = yaml.safe_load(file)
@@ -97,6 +130,7 @@ def load_config(path: str | Path) -> Config:
         sizing_mode=str(trading.get("sizing_mode", "fixed")),
         notional_usdt=float(trading.get("notional_usdt", 100.0)),
         equity_pct=float(trading.get("equity_pct", 0.0)),
+        risk_per_trade_pct=float(trading.get("risk_per_trade_pct", 1.0)),
         leverage=int(trading.get("leverage", 1)),
         stop_loss_pct=float(trading.get("stop_loss_pct", 3.0)),
         take_profit_pct=float(trading.get("take_profit_pct", 0.0)),
@@ -156,12 +190,16 @@ def validate(config: Config) -> None:
         raise ValueError(f"reconnect_seconds must be >= 1, got {config.reconnect_seconds}")
 
     trading = config.trading
-    if trading.sizing_mode not in ("fixed", "equity"):
-        raise ValueError(f"sizing_mode must be 'fixed' or 'equity', got {trading.sizing_mode!r}")
+    if trading.sizing_mode not in ("fixed", "equity", "risk"):
+        raise ValueError(
+            f"sizing_mode must be 'fixed', 'equity' or 'risk', got {trading.sizing_mode!r}")
     if trading.sizing_mode == "fixed" and trading.notional_usdt <= 0:
         raise ValueError(f"notional_usdt must be > 0, got {trading.notional_usdt}")
     if trading.sizing_mode == "equity" and not 0 < trading.equity_pct <= 100:
         raise ValueError(f"equity_pct must be in (0, 100], got {trading.equity_pct}")
+    if trading.sizing_mode == "risk" and not 0 < trading.risk_per_trade_pct <= 100:
+        raise ValueError(
+            f"risk_per_trade_pct must be in (0, 100], got {trading.risk_per_trade_pct}")
     if not 1 <= trading.leverage <= 125:
         raise ValueError(f"leverage must be between 1 and 125, got {trading.leverage}")
     if not 0 < trading.stop_loss_pct < 100:
@@ -175,6 +213,29 @@ def validate(config: Config) -> None:
         raise ValueError(f"position_mode must be 'cross' or 'isolated', got {trading.position_mode!r}")
     if not trading.symbols:
         raise ValueError("trading.symbols must list at least one instrument")
+
+    # --- 止损必须落在强平价之内 ------------------------------------------------
+    # 止损挂在强平价之外，等于没有止损：交易所会先强平，止损单永远等不到成交。
+    # 50x 强平距离约 2%，挂 2% 止损就是"止损和强平赛跑"，插针就输。
+    # 这不是保守偏好，是订单簿上的先后顺序。
+    liq = liquidation_distance_pct(trading.leverage)
+    if trading.stop_loss_pct >= liq:
+        raise ValueError(
+            f"stop_loss_pct ({trading.stop_loss_pct}) must be below the liquidation "
+            f"distance at {trading.leverage}x (~{liq:.2f}%). "
+            f"A stop beyond liquidation never fills — reduce leverage or tighten the stop.")
+
+    # --- 单笔风险上限 ----------------------------------------------------------
+    # stop_loss_pct x leverage x 仓位占比 = 亏到止损时账户的实际损失。
+    # 高杠杆 + 宽止损会让这个数轻易上到 50%+，连亏两笔就归零 —— 而这不是"激进"，
+    # 是让熔断阈值形同虚设。上限 25% ≈ 连亏 4 笔还剩 32%。
+    risk_per_trade = account_risk_per_trade_pct(trading)
+    if risk_per_trade > 25:
+        raise ValueError(
+            f"one stop would lose {risk_per_trade:.1f}% of equity "
+            f"(stop {trading.stop_loss_pct}% x {trading.leverage}x x "
+            f"{trading.sizing_mode}), above the 25% survivability ceiling. "
+            f"Use sizing_mode: risk with risk_per_trade_pct, or cut leverage/position size.")
 
     # 熔断阈值的上界必须挡在启动前：一个永远触发不了的阈值不是"宽松"，是静默
     # 失效——回撤不可能超过 100%，单仓浮亏最多亏掉全部权益，写过头等于没写。

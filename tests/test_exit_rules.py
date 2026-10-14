@@ -134,9 +134,14 @@ class _Pinned:
         return False
 
 
-def _new_executor(broker: FakeBroker, ledger: Ledger):
+def _new_executor(broker: FakeBroker, ledger: Ledger, *, take_profit_pct: float | None = None):
     config = load_config(CONFIG)
-    config = replace(config, trading=replace(config.trading, symbols=(SYMBOL,)))
+    overrides = {"symbols": (SYMBOL,)}
+    if take_profit_pct is not None:
+        # 测试自己指定被测参数，不读config.yaml 的默认值：默认止盈是 0
+        # （趋势策略不主动止盈），拿默认值来断言"止盈被传给broker"是错的依赖。
+        overrides["take_profit_pct"] = take_profit_pct
+    config = replace(config, trading=replace(config.trading, **overrides))
     return Executor(config, broker, ledger)
 
 
@@ -146,11 +151,16 @@ def _ledger() -> Ledger:
 
 # --------------------------------------------------------------- 止盈挂单
 def test_take_profit_reaches_the_broker() -> int:
-    """config 里写了 take_profit_pct，executor 就必须把它交给 broker。"""
+    """配了 take_profit_pct，executor 就必须把它交给 broker。
+
+    止盈百分比由测试显式指定（2.0），而不是读 config.yaml —— 要测的是"这个值
+    有没有传到 broker"，不是"默认值恰好是多少"。默认止盈为 0（不挂止盈）时，
+    这条断言本来就无从成立。
+    """
     failures = 0
     broker, ledger = FakeBroker(), _ledger()
     with _Pinned("long", 1000) as pin:
-        _new_executor(broker, ledger).poll()
+        _new_executor(broker, ledger, take_profit_pct=2.0).poll()
     failures += _expect(len(broker.entered) == 1, f"应开 1 笔，实际 {broker.entered}")
     if broker.entered:
         _, side, tp_pct, tp_price = broker.entered[0]
@@ -163,7 +173,7 @@ def test_take_profit_reaches_the_broker() -> int:
     # 空单方向相反。
     broker2, ledger2 = FakeBroker(), _ledger()
     with _Pinned("short", 1000):
-        _new_executor(broker2, ledger2).poll()
+        _new_executor(broker2, ledger2, take_profit_pct=2.0).poll()
     if broker2.entered:
         _, _, _, tp_price = broker2.entered[0]
         failures += _expect(tp_price < broker2.price_value,
