@@ -215,9 +215,10 @@ def ensure_data(store, inst_id: str) -> bool:
     return need
 
 
+@paper.serialised
 def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
                 ticker_fn=None, allow_open: bool = True,
-                halted: bool = False) -> dict:
+                halted: bool = False, risk_check_fn=None) -> dict:
     """Evaluate the newest confirmed bar once for ONE symbol; act on a signal.
 
     Injectable seams (`signal_fn`, `price_fn`, `ticker_fn`) keep this testable
@@ -335,6 +336,7 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
     side = signal.side
     price_fn = price_fn or _spread_prices
     state = get_state(store)
+    allow_open = allow_open and len(store.open_orders()) < state["max_positions"]
 
     opens = store.open_orders(inst_id)
     same = [o for o in opens if o["side"] == side]
@@ -364,11 +366,18 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
             exit_price = prices["bid"] if o["side"] == "long" else prices["ask"]
             out = paper.close_position(store, o["id"], exit_price)
             closed.append({"id": o["id"], "pnl": out["pnl"]})
+        if closed and risk_check_fn is not None:
+            try:
+                risk_check_fn(store)
+            except Exception:
+                health.set_risk_halt(store, "平仓后风控检查失败，请检查行情和账户")
+                raise
+        halted = halted or health.risk_halted(store)
         if not same and not halted:
             entry = prices["ask"] if side == "long" else prices["bid"]
             opened = paper.open_position(store, inst_id, side,
                                          state["notional"], state["leverage"],
-                                         entry)
+                                         entry, stop_loss_pct=cfg.trading.stop_loss_pct)
         acted = opened is not None or bool(closed)
         store.add_signal(inst_id, side, f"auto: {signal.reason}",
                          price=prices.get("last"), ema_fast=float(r5["ema_fast"]),
@@ -403,7 +412,7 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
 
 
 def maybe_trade_all(store, *, signal_fn=None, price_fn=None,
-                    ticker_fn=None, top_up: bool = True) -> dict:
+                    ticker_fn=None, top_up: bool = True, risk_check_fn=None) -> dict:
     """Scan every watched symbol and act on whichever ones have a signal.
 
     `top_up=False` skips the candle freshness check, for callers (and tests)
@@ -435,6 +444,8 @@ def maybe_trade_all(store, *, signal_fn=None, price_fn=None,
     for inst in symbols:
         # Capacity is re-evaluated per symbol: an earlier symbol in the list
         # may have opened something, so "allowed" can flip mid-scan.
+        halted = health.risk_halted(store)
+        open_count = len(store.open_orders())
         allow_open = open_count < cap and not halted
         try:
             # Self-healing: a symbol added to the watch list five seconds ago
@@ -444,7 +455,8 @@ def maybe_trade_all(store, *, signal_fn=None, price_fn=None,
                 ensure_data(store, inst)
             res = maybe_trade(store, inst, signal_fn=signal_fn,
                               price_fn=price_fn, ticker_fn=ticker_fn,
-                              allow_open=allow_open, halted=halted)
+                              allow_open=allow_open, halted=halted,
+                              risk_check_fn=risk_check_fn)
         except Exception as exc:  # noqa: BLE001 - one bad symbol, not the scan
             _record_scan(store, inst, ts=0, side=None, acted=False,
                          why=f"scan error: {type(exc).__name__}: {exc}")

@@ -111,7 +111,7 @@ def drawdown_pct(equity: float, peak: float) -> float:
 
 def realized_pnl(broker, symbol: str, position: Position,
                  exit_price: float) -> float | None:
-    """一笔仓位的已实现盈亏（计价货币；含价格变动，不含手续费与资金费）。
+    """Completed-trade PnL: exchange fills and fees when supported by the broker.
 
     走 `notional_for_contracts` 而不是 `size * (exit - entry)`：一张合约不等
     于一个币（BTC-USDT-SWAP 是 0.01 BTC），直接相乘会高估 100 倍。
@@ -121,6 +121,9 @@ def realized_pnl(broker, symbol: str, position: Position,
     """
     if not position.is_open or position.size <= 0:
         return None
+    settlement = getattr(broker, "closed_pnl", None)
+    if callable(settlement) and not getattr(broker, "dry_run", False):
+        return settlement(symbol, position)
     if position.entry_price <= 0 or exit_price <= 0:
         return None
     try:
@@ -188,10 +191,9 @@ class RiskGuard:
             if live is None:
                 booked = self._book_remote_close(symbol, position)
                 if booked is not None and booked.halted:
-                    # 记账本身就踩到了连亏上限。这里返回空 close_symbols：交易所
-                    # 已经没有这个仓位了，其余持仓留给下一轮——那时 check() 走
-                    # halted 分支，会一次性平掉。
-                    return RiskDecision(halted=True, reason=booked.reason)
+                    return RiskDecision(
+                        halted=True, reason=booked.reason,
+                        close_symbols=tuple(s for s in booked.close_symbols if s != symbol))
                 continue
 
             unrealized = float(live.get("unrealizedPnl") or 0.0)
@@ -218,7 +220,7 @@ class RiskGuard:
         """
         if pnl < 0:
             self.risk.consecutive_losses += 1
-        else:
+        elif pnl > 0:
             # 与 platform/backend/health.py 的 consecutive_losses 保持一致：
             # 只有真正的盈利才清零，不赚不赔的一笔不算赢（它同样交了手续费）。
             self.risk.consecutive_losses = 0

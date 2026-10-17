@@ -369,6 +369,11 @@ def evaluate_risk(positions: list[dict], *, equity: float, baseline: float,
     #    so the account-level flatten never ran).
     condemned: dict[int, str] = {}
     for p in positions:
+        stop = p.get("stop_price")
+        mark = p.get("mark_price")
+        if stop and mark and ((p["side"] == "long" and mark <= stop)
+                              or (p["side"] == "short" and mark >= stop)):
+            condemned[p["id"]] = f"price-stop:{p.get('inst_id')}"
         margin = float(p.get("margin") or 0.0)
         if margin <= 0:
             continue
@@ -403,7 +408,7 @@ def evaluate_risk(positions: list[dict], *, equity: float, baseline: float,
             detail={"drawdown_pct": round(
                         (baseline - equity) / baseline * 100.0, 2),
                     "limit_pct": limits.max_drawdown_pct,
-                    "condemned": sorted(condemned) or "ALL"},
+                    "condemned": "ALL"},
         )
     if condemned:
         # Report the first condemned position, but the caller closes them all.
@@ -442,7 +447,7 @@ def consecutive_losses(store, since_id: int = 0) -> int:
     for r in rows:
         if float(r["pnl"]) < 0:
             streak += 1
-        else:
+        elif float(r["pnl"]) > 0:
             break
     return streak
 
@@ -507,6 +512,12 @@ def enforce_risk(store, *, limits: RiskLimits, marks: dict | None = None,
     # pass is still a halt, and the report is what the UI and the auto-trader
     # both look at.
     report.update(_halt_fields(store))
+    if risk_halted(store):
+        # A failed account-level flatten must keep retrying even when the
+        # remaining positions no longer cross the original threshold.
+        decision = RiskDecision(should_close=bool(positions),
+                                reason=risk_halt_state(store)["reason"], halt=True,
+                                detail={"condemned": "ALL"})
     if not decision.should_close:
         return report
     report["reason"] = decision.reason

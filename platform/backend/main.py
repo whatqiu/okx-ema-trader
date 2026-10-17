@@ -12,6 +12,7 @@ Run from this directory:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -131,11 +132,14 @@ def _run_risk_check(store) -> dict:
     race on the balance check and one would raise "position does not exist".
     """
     global _last_risk
-    with _risk_lock:
+    # Always acquire the account lock first: scans call back here while holding it.
+    with store.trade_lock, _risk_lock:
         report = health.enforce_risk(store, limits=RISK_LIMITS,
                                      marks=_marks(store),
                                      exit_prices=_exit_prices(store))
         _last_risk = report
+        if report.get("error") or report.get("failed"):
+            raise HTTPException(503, report.get("error") or "风控平仓未完成，请稍后重试")
     return report
 
 
@@ -172,8 +176,12 @@ def _auto_pass() -> None:
             # shows up in the badge while auto-trading is off.
             _auto_health.idle()
             return
-        autotrader.maybe_trade_all(store)
-        _auto_health.ok()
+        result = autotrader.maybe_trade_all(store, risk_check_fn=_run_risk_check)
+        errors = [r["error"] for r in result["results"] if r.get("error")]
+        if errors:
+            _auto_health.fail(errors[0])
+        else:
+            _auto_health.ok()
     except Exception as exc:
         # Recorded, not swallowed. The previous `except Exception: continue`
         # kept the loop alive but erased the reason, which made an outage
@@ -580,7 +588,8 @@ def autotrade_set(patch: AutoTradePatch):
                  label=f"candles {inst} 15m")
             _watch(inst, cfg.bar_5m, pin=True)
             _watch(inst, cfg.bar_15m, pin=True)
-        autotrader.maybe_trade_all(store)
+        _run_risk_check(store)
+        autotrader.maybe_trade_all(store, risk_check_fn=_run_risk_check)
         state = autotrader.get_state(store)
     return _json_safe(state)
 
@@ -588,6 +597,28 @@ def autotrade_set(patch: AutoTradePatch):
 # --------------------------------------------------------------------------
 # Paper trading — fills at REAL bid/ask, taker fee on both sides
 # --------------------------------------------------------------------------
+def _risk_ticker(store, inst: str) -> dict:
+    """Never use a stale quote to value or close an open position."""
+    tick = _poller.latest_ticker(inst) if _poller else store.tick(inst)
+    def fresh(value):
+        if not value:
+            return False
+        try:
+            return (all(math.isfinite(float(value[k])) and float(value[k]) > 0
+                        for k in ("last", "bid", "ask"))
+                    and float(value["bid"]) <= float(value["ask"])
+                    and 0 <= time.time() * 1000 - float(value.get("ts") or 0) <= 60_000)
+        except (KeyError, TypeError, ValueError):
+            return False
+    if not fresh(tick):
+        tick = store.tick(inst)
+    if not fresh(tick):
+        tick = _okx(lambda: market.fetch_ticker(store, inst), label=f"ticker {inst}")
+    if not fresh(tick):
+        raise HTTPException(503, f"{inst} 行情已过期，暂停开仓，等待行情恢复")
+    return tick
+
+
 def _marks(store) -> dict[str, float]:
     """inst_id -> last price for every symbol with an open position.
 
@@ -600,14 +631,7 @@ def _marks(store) -> dict[str, float]:
         inst = o["inst_id"]
         if inst in marks:
             continue
-        tick = _poller.latest_ticker(inst) if _poller else store.tick(inst)
-        if tick and tick.get("last"):
-            marks[inst] = tick["last"]
-        else:
-            try:
-                marks[inst] = market.fetch_ticker(store, inst)["last"]
-            except OkxError:
-                pass  # entry-price fallback inside account_summary
+        marks[inst] = _risk_ticker(store, inst)["last"]
     return marks
 
 
@@ -624,13 +648,8 @@ def _exit_prices(store) -> dict[str, tuple]:
         inst = o["inst_id"]
         if inst in prices:
             continue
-        tick = _poller.latest_ticker(inst) if _poller else store.tick(inst)
-        if not tick or not (tick.get("bid") and tick.get("ask")):
-            try:
-                tick = market.fetch_ticker(store, inst)
-            except OkxError:
-                tick = None
-        prices[inst] = ((tick or {}).get("bid"), (tick or {}).get("ask"))
+        tick = _risk_ticker(store, inst)
+        prices[inst] = (tick["bid"], tick["ask"])
     return prices
 
 
@@ -665,6 +684,7 @@ def health_status():
                 "max_drawdown_pct": RISK_LIMITS.max_drawdown_pct,
                 "max_consecutive_losses": RISK_LIMITS.max_consecutive_losses,
                 "liq_buffer_pct": RISK_LIMITS.liq_buffer_pct,
+                "stop_loss_pct": deps.config().trading.stop_loss_pct,
             },
             "last": _last_risk,
             # The streak the brake actually judges (counted from the last manual
@@ -725,6 +745,9 @@ class TradeOpenRequest(BaseModel):
 def trade_open(req: TradeOpenRequest):
     inst = _symbol(req.symbol)
     store = deps.store()
+    _run_risk_check(store)
+    if health.risk_halted(store):
+        raise HTTPException(409, "风控已熔断，解除后才能开仓")
     tick = _okx(lambda: market.fetch_ticker(store, inst), label=f"ticker {inst}")
     # Cross the spread like a real market order: long pays ask, short hits bid.
     side = req.side.lower()
@@ -733,7 +756,9 @@ def trade_open(req: TradeOpenRequest):
         raise HTTPException(502, f"{inst} 没有可用的{'卖一' if side == 'long' else '买一'}价")
     try:
         result = paper.open_position(store, inst, side, req.notional,
-                                     req.leverage, price)
+                                     req.leverage, price,
+                                     stop_loss_pct=deps.config().trading.stop_loss_pct,
+                                     marks=_marks(store))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     _watch(inst, "5m")

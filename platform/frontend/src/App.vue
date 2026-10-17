@@ -593,7 +593,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
 
         <span v-if="status && riskActive" class="badge"
               :class="losingStreak > 0 ? 'badge--warn' : 'badge--idle'"
-              :title="`风控：单仓浮亏 >${status.risk.limits.max_loss_pct}% 强平｜账户回撤 >${status.risk.limits.max_drawdown_pct}% 强平｜连亏 ${status.risk.limits.max_consecutive_losses} 次停手`">
+              :title="`价格止损 ${status.risk.limits.stop_loss_pct}%｜账户回撤 ${status.risk.limits.max_drawdown_pct}% 或连亏 ${status.risk.limits.max_consecutive_losses} 次后平仓停手`">
           {{ riskHalted ? '风控熔断' : losingStreak > 0 ? `连亏${losingStreak}` : '风控启用' }}
         </span>
 
@@ -776,6 +776,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
               :ref-price="refPrice"
               :available="account?.available || 0"
               :busy="trading"
+              :blocked="riskHalted ? '风控已熔断，暂停开仓' : !connOk ? '连接恢复后可开仓' : !account ? '正在读取账户' : ''"
               @submit="openTrade"
               @set-pct="setNotionalPct" />
           </section>

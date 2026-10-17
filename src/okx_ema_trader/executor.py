@@ -116,12 +116,7 @@ class Executor:
         # stop_loss_pct × leverage 推导。
         self.guard = RiskGuard(GuardLimits.for_trading(self.trading, config.risk),
                                broker, ledger)
-        # The entry rule is stateful when it is not the default: a pullback is a
-        # STATE, not an event, so it needs its latch carried across loops. One
-        # instance per Executor (not per call) or it would fire on every loop.
-        self._entry: Callable | None = None
-        if config.entry_mode == "pullback":
-            self._entry = PullbackEntry(tolerance=config.pullback_tolerance)
+        self._entries: dict[str, PullbackEntry] = {}
 
     # ------------------------------------------------------------ startup gate
     def reconcile(self) -> None:
@@ -177,6 +172,8 @@ class Executor:
             return
 
         for symbol in self.trading.symbols:
+            if self.ledger.risk.halted:
+                break
             try:
                 self._poll_symbol(symbol)
             except (BrokerError, StateError) as exc:
@@ -195,7 +192,7 @@ class Executor:
         ind_15m = calculate_indicators(series_15m, self.config.ema_fast,
                                        self.config.ema_slow, self.config.adx_period)
 
-        if self._entry is None:
+        if self.config.entry_mode != "pullback":
             signal, reason = _classify(ind_5m, ind_15m, self.config.adx_min,
                                        self.config.deviation_max)
         else:
@@ -203,7 +200,9 @@ class Executor:
             # can also mean "already fired on this dip". REASON_NO_ENV is the
             # honest label either way the UI reads it, and the latched state is
             # an entry-rule detail, not a market condition.
-            hit = self._entry(ind_5m, ind_15m, self.config.adx_min,
+            entry = self._entries.setdefault(
+                symbol, PullbackEntry(tolerance=self.config.pullback_tolerance))
+            hit = entry(ind_5m, ind_15m, self.config.adx_min,
                               self.config.deviation_max)
             signal = hit
             reason = hit.side if hit else REASON_NO_CROSS
@@ -289,14 +288,16 @@ class Executor:
             logging.warning("%s: 读不到平仓价（%s），按止损价估算盈亏", symbol, exc)
             exit_price = booked.stop_price
 
-        pnl = realized_pnl(self.broker, symbol, booked, exit_price)
+        pnl = (None if booked.settled else
+               realized_pnl(self.broker, symbol, booked, exit_price))
         self.ledger.clear(symbol)
         self.ledger.last_exit[symbol] = f"{booked.side}:{ind_15m.get('ts')}"
         self.ledger.save()
 
         logging.warning("%s: 交易所已平仓（止盈/止损成交），按 %.6f 结算", symbol, exit_price)
         if pnl is None:
-            logging.warning("%s: 这一笔的盈亏算不出来，未计入风控计数", symbol)
+            if not booked.settled:
+                logging.warning("%s: 这一笔的盈亏算不出来，未计入风控计数", symbol)
             return
         # 平仓之后记账，和 _flip 里同样的顺序理由：挡不住的永远是下一笔。
         decision = self.guard.record_close(pnl)
@@ -317,6 +318,8 @@ class Executor:
 
     def _flip(self, symbol: str, signal: Signal, booked: Position) -> None:
         """Close the old side (if any) and open the new one with its stop."""
+        if self.ledger.risk.halted:
+            return
         if booked.is_open:
             closed = self.broker.close_position(symbol)
             if not closed and not self.dry_run:
@@ -351,7 +354,11 @@ class Executor:
         equity = self.broker.verify_demo() if not self.dry_run else self._equity
         exposure = exposure_for(self.trading, equity)
 
-        projected = self.ledger.total_notional({}) + exposure
+        held_notional = sum(
+            self.broker.notional_for_contracts(
+                held, self.ledger.get(held).size, self.ledger.get(held).entry_price)
+            for held in self.ledger.open_symbols())
+        projected = held_notional + exposure
         if projected > self.trading.max_total_notional:
             logging.warning(
                 "%s: skipping entry — %.2f USDT exposure would exceed the %.2f cap",
@@ -363,7 +370,7 @@ class Executor:
         # balance, so a second symbol would be rejected by the exchange. Catching
         # it here turns a confusing order rejection into a clear log line.
         required_margin = exposure / max(self.trading.leverage, 1)
-        held_margin = self.ledger.total_notional({}) / max(self.trading.leverage, 1)
+        held_margin = held_notional / max(self.trading.leverage, 1)
         free_margin = max(equity - held_margin, 0.0)
         if required_margin > free_margin:
             logging.warning(

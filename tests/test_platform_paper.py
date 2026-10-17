@@ -89,11 +89,11 @@ def test_long_profit_includes_both_fees():
     res = paper.open_position(store, INST, "long", notional=1000.0,
                               leverage=10.0, price=100.0)
     out = paper.close_position(store, res["order_id"], 110.0)
-    # gross = +10% of 1000 = 100; fees = 0.5 open + 0.5 close
-    check(close(out["pnl"], 99.0), f"pnl {out['pnl']} != 99.0")
-    check(close(out["pnl_pct"], 99.0 / 100.0), "pnl_pct must be vs margin")
+    # Closing notional is 1100, so closing fee is 0.55.
+    check(close(out["pnl"], 98.95), f"pnl {out['pnl']} != 98.95")
+    check(close(out["pnl_pct"], 98.95 / 100.0), "pnl_pct must be vs margin")
     acc = paper.account_summary(store)
-    check(close(acc["balance"], 10_099.0), f"balance {acc['balance']}")
+    check(close(acc["balance"], 10_098.95), f"balance {acc['balance']}")
     check(close(acc["equity"], acc["balance"]), "no open positions: equity == balance")
     store.close(); tmp.cleanup()
 
@@ -103,8 +103,8 @@ def test_short_loss_accounting():
     res = paper.open_position(store, INST, "short", notional=1000.0,
                               leverage=5.0, price=100.0)
     out = paper.close_position(store, res["order_id"], 104.0)
-    # short loses 4% of 1000 = -40, minus 1.0 fees
-    check(close(out["pnl"], -41.0), f"short pnl {out['pnl']} != -41")
+    # short loses 4% of 1000 = -40, minus 0.5 + 0.52 fees.
+    check(close(out["pnl"], -41.02), f"short pnl {out['pnl']} != -41.02")
     store.close(); tmp.cleanup()
 
 
@@ -118,7 +118,7 @@ def test_equity_does_not_teleport_more_than_close_fee():
     paper.close_position(store, res["order_id"], 110.0)
     after = paper.account_summary(store)["equity"]
     jump = before - after
-    check(close(jump, 0.5), f"equity jumped {jump} at close (should be close fee 0.5)")
+    check(close(jump, 0.55), f"equity jumped {jump} at close (should be close fee 0.55)")
     store.close(); tmp.cleanup()
 
 

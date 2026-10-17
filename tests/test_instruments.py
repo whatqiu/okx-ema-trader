@@ -318,6 +318,9 @@ def test_stop_lookup_waits_for_registration():
             self.pages = list(pages)
             self.calls = 0
 
+        def fetch_order(self, order_id, market):
+            return {"info": {"attachAlgoOrds": [{"attachAlgoId": "algo1"}]}}
+
         def fetch_open_orders(self, market, params=None):
             self.calls += 1
             return self.pages.pop(0) if self.pages else []

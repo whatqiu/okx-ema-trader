@@ -129,6 +129,7 @@ class Store:
         self.path = Path(path) if path else DEFAULT_DB_PATH
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
+        self.trade_lock = threading.RLock()
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
 
@@ -332,6 +333,16 @@ class Store:
             return [dict(r) for r in conn.execute(
                 sql + " ORDER BY created_at DESC LIMIT ?", [*params, int(limit)])]
 
+    def realised_pnl(self) -> float:
+        """Lifetime PnL, including closed orders archived by retention."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE((SELECT SUM(pnl) FROM orders WHERE status='closed'), 0) "
+                "+ COALESCE((SELECT CAST(value AS REAL) FROM meta "
+                "WHERE key='paper_archived_pnl'), 0) AS pnl"
+            ).fetchone()
+        return float(row["pnl"])
+
     def known_symbols(self) -> list[str]:
         """Every symbol we hold any local data for.
 
@@ -425,6 +436,12 @@ class Store:
     def prune(self, candle_days: int = 45, keep_signals: int = 500,
               keep_orders: int = 1000, keep_equity: int = 2000,
               keep_backtests: int = 50) -> dict:
+        with self.trade_lock:
+            return self._prune(candle_days, keep_signals, keep_orders,
+                               keep_equity, keep_backtests)
+
+    def _prune(self, candle_days: int, keep_signals: int,
+               keep_orders: int, keep_equity: int, keep_backtests: int) -> dict:
         """Retention sweep + disk reclaim. Returns per-table delete counts.
 
         Why 45 days for candles and not fewer: the 30-day backtest is a core
@@ -449,6 +466,18 @@ class Store:
                 "DELETE FROM signals WHERE id NOT IN "
                 "(SELECT id FROM signals ORDER BY ts DESC, id DESC LIMIT ?)",
                 (keep_signals,)).rowcount
+            # Archive money in the SAME transaction as deleting its detail.
+            # Repeated sweeps then cannot lose or count a trade twice.
+            archived = conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0) FROM orders WHERE status='closed' AND id NOT IN "
+                "(SELECT id FROM orders WHERE status != 'filled' "
+                " ORDER BY created_at DESC, id DESC LIMIT ?)", (keep_orders,)
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('paper_archived_pnl', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS REAL)+excluded.value",
+                (str(float(archived)),),
+            )
             deleted["orders"] = conn.execute(
                 "DELETE FROM orders WHERE status != 'filled' AND id NOT IN "
                 "(SELECT id FROM orders WHERE status != 'filled' "

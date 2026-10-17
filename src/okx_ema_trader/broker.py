@@ -303,8 +303,10 @@ class Broker:
                       symbol, order.get("id"))
             try:
                 self.close_position(symbol)
-            finally:
-                raise BrokerError(f"entry for {symbol} filled without a stop; position was closed")
+            except BrokerError as exc:
+                raise BrokerError(
+                    f"{symbol}: 止损未验证且紧急平仓失败，请立即核对持仓：{exc}") from exc
+            raise BrokerError(f"entry for {symbol} filled without a stop; position was closed")
 
         # `filled * fill_price` was wrong here and nowhere else: it treats one
         # contract as one coin. On BTC-USDT-SWAP that overstates the position
@@ -337,6 +339,15 @@ class Broker:
         market = to_ccxt_symbol(symbol)
         for attempt in range(3):
             try:
+                if not order_id:
+                    return None
+                parent = self.exchange.fetch_order(order_id, market)
+                attachments = (parent.get("info") or {}).get("attachAlgoOrds") or []
+                attached_ids = {
+                    str(value) for attachment in attachments
+                    for value in (attachment.get("algoId"), attachment.get("attachAlgoId"))
+                    if value
+                }
                 algos = self.exchange.fetch_open_orders(market, params={"ordType": "conditional"})
             except Exception as exc:
                 log.warning("could not read back algo orders (%s); retry %d/3", exc, attempt + 1)
@@ -344,6 +355,11 @@ class Broker:
                 continue
             for algo in algos:
                 info = algo.get("info") or {}
+                algo_id = str(algo.get("id") or info.get("algoId") or "")
+                if not (algo_id in attached_ids or
+                        str(info.get("attachAlgoId") or "") in attached_ids or
+                        str(info.get("ordId") or "") == str(order_id)):
+                    continue
                 if info.get("slTriggerPx"):
                     return str(algo.get("id") or info.get("algoId") or "")
                 if algo.get("stopLossPrice"):
@@ -353,6 +369,56 @@ class Broker:
         return None
 
     # ------------------------------------------------------------------- exits
+    def closed_pnl(self, symbol: str, position) -> float:
+        """Settle a completed position from fills and USDT fees, never a ticker.
+
+        Missing or ambiguous fills are retried on the next cycle. This bot owns
+        one net position per symbol; intervening manual trades require review.
+        Funding remains reflected in exchange equity, outside the trade streak.
+        """
+        try:
+            trades = self.exchange.fetch_my_trades(
+                to_ccxt_symbol(symbol), since=max(0, position.entry_ts - 60_000), limit=100)
+        except Exception as exc:
+            raise BrokerError(f"{symbol}: 无法读取平仓成交，稍后重试：{exc}") from exc
+        entries = [t for t in trades if str(t.get("order")) == position.entry_order_id]
+        tolerance = max(position.size * 1e-8, 1e-10)
+        if not entries or abs(sum(float(t.get("amount") or 0) for t in entries)
+                              - position.size) > tolerance:
+            raise BrokerError(f"{symbol}: 入场成交记录不完整，暂停交易等待核对")
+        entry_side = "buy" if position.side == "long" else "sell"
+        first_ts = min(int(t.get("timestamp") or 0) for t in entries)
+        candidates = sorted(
+            [t for t in trades if str(t.get("order")) != position.entry_order_id
+             and int(t.get("timestamp") or 0) >= first_ts],
+            key=lambda t: int(t.get("timestamp") or 0))
+        exits, quantity = [], 0.0
+        for trade in candidates:
+            if trade.get("side") == entry_side:
+                raise BrokerError(f"{symbol}: 存在额外加仓成交，请核对仓位")
+            exits.append(trade)
+            quantity += float(trade.get("amount") or 0)
+            if quantity >= position.size - tolerance:
+                break
+        if abs(quantity - position.size) > tolerance:
+            raise BrokerError(f"{symbol}: 平仓成交记录不完整，暂停交易等待核对")
+
+        def value(fills):
+            return sum(self.notional_for_contracts(
+                symbol, float(t["amount"]), float(t["price"])) for t in fills)
+
+        fees = 0.0
+        for trade in entries + exits:
+            paid = trade.get("fees") or ([trade["fee"]] if trade.get("fee") else [])
+            if not paid:
+                raise BrokerError(f"{symbol}: 成交手续费尚未返回，稍后重试")
+            for fee in paid:
+                if fee.get("currency") != "USDT" or fee.get("cost") is None:
+                    raise BrokerError(f"{symbol}: 无法换算成交手续费，请核对")
+                fees += float(fee["cost"])
+        gross = value(exits) - value(entries)
+        return (gross if position.side == "long" else -gross) - fees
+
     def get_position(self, symbol: str) -> dict | None:
         """Current exchange position for `symbol`, or None when flat."""
         self.load_markets()

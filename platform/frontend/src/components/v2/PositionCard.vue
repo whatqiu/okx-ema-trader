@@ -127,6 +127,7 @@ function fmtTime(ts) {
     <footer class="pos__foot">
       <span class="num">名义 {{ fmtUsd(position.notional) }}</span>
       <span class="num">保证金 {{ fmtUsd(position.margin) }}</span>
+      <span v-if="position.stop_price" class="num">止损 {{ fmtNum(position.stop_price) }}</span>
       <span class="num tone-dim">{{ fmtTime(position.opened_at) }}</span>
       <button class="btn btn--danger pos__close"
               :disabled="busy" @click="emit('close', position)">

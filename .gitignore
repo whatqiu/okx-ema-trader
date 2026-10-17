@@ -8,6 +8,7 @@ env/
 
 # Runtime output — regenerated, never a source of truth
 logs/
+.test-tmp/
 data/
 state.yaml
 *.log

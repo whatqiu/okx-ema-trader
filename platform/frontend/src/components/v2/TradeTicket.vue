@@ -18,6 +18,7 @@ const props = defineProps({
   leverage: { type: Number, required: true },
   available: { type: Number, default: 0 },
   busy: { type: Boolean, default: false },
+  blocked: { type: String, default: '' },
 })
 
 const emit = defineEmits([
@@ -58,14 +59,18 @@ const liqEstimate = computed(() => {
 
 // 所需保证金超过可用余额时不可下单。这里提前拦住，
 // 而不是让后端返回 400 后用户在横幅里读错误信息。
-const insufficient = computed(() => margin.value > props.available && props.available > 0)
+const insufficient = computed(() => margin.value + feeOpen.value > props.available)
 const canSubmit = computed(() =>
-  !props.busy && props.notional > 0 && props.leverage > 0 && !insufficient.value)
+  !props.busy && !props.blocked && Number.isFinite(props.refPrice) && props.refPrice > 0
+  && Number.isFinite(props.notional) && props.notional > 0
+  && props.leverage >= 1 && props.leverage <= 125 && !insufficient.value)
 
 const blockedReason = computed(() => {
   if (props.busy) return '下单中…'
+  if (props.blocked) return props.blocked
+  if (!props.refPrice || !Number.isFinite(props.refPrice)) return '等待最新报价'
   if (insufficient.value) {
-    return `保证金 ${margin.value.toFixed(2)} 超出可用 ${props.available.toFixed(2)}`
+    return `保证金和手续费 ${(margin.value + feeOpen.value).toFixed(2)} 超出可用 ${props.available.toFixed(2)}`
   }
   return isLong.value ? '买入开多' : '卖出开空'
 })

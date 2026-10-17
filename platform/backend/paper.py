@@ -13,9 +13,21 @@ curve in the UI has something to draw.
 """
 from __future__ import annotations
 
+import math
+from functools import wraps
+
 DEFAULT_BALANCE = 10_000.0
 TAKER_FEE_BPS = 5.0        # OKX swap VIP0 taker, per side
 _META_KEY = "paper_initial_balance"
+
+
+def serialised(fn):
+    """Serialize account mutations across requests and the background scanner."""
+    @wraps(fn)
+    def run(store, *args, **kwargs):
+        with store.trade_lock:
+            return fn(store, *args, **kwargs)
+    return run
 
 
 def initial_balance(store) -> float:
@@ -26,13 +38,19 @@ def initial_balance(store) -> float:
     return float(raw)
 
 
+@serialised
 def reset_account(store, balance: float = DEFAULT_BALANCE) -> None:
     """Wipe every order and restart the account. There is no partial reset —
     a half-reset account with orphaned positions is worse than none."""
+    if not math.isfinite(balance) or balance <= 0:
+        raise ValueError("初始余额必须是大于 0 的有限数字")
     with store._connect() as conn:
         conn.execute("DELETE FROM orders")
         conn.execute("DELETE FROM equity")
-    store.set_meta(_META_KEY, str(float(balance)))
+        conn.execute("DELETE FROM meta WHERE key='paper_archived_pnl'")
+        conn.execute("INSERT INTO meta(key,value) VALUES (?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (_META_KEY, str(float(balance))))
     store.add_equity(float(balance), note="reset")
 
 
@@ -48,8 +66,10 @@ def _f(value) -> float | None:
         return None
 
 
+@serialised
 def open_position(store, inst_id: str, side: str, notional: float,
-                  leverage: float, price: float) -> dict:
+                  leverage: float, price: float, *, stop_loss_pct: float = 0.0,
+                  marks: dict[str, float] | None = None) -> dict:
     """Open a paper position at `price` (caller passes real bid/ask).
 
     Raises ValueError on anything that would be rejected by a real exchange's
@@ -58,23 +78,31 @@ def open_position(store, inst_id: str, side: str, notional: float,
     """
     if side not in ("long", "short"):
         raise ValueError(f"side 必须是 long 或 short，收到 {side!r}")
-    if notional <= 0:
+    if store.get_meta("risk_halted", "0") == "1":
+        raise ValueError("风控已熔断，解除后才能开仓")
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("成交价格必须大于 0 且为有限数字")
+    if not math.isfinite(notional) or notional <= 0:
         raise ValueError("名义价值必须大于 0")
     if not (1 <= leverage <= 125):
         raise ValueError("杠杆必须在 1–125 之间")
 
+    if not math.isfinite(stop_loss_pct) or not 0 <= stop_loss_pct < 100:
+        raise ValueError("止损百分比必须在 0–100 之间")
     margin = notional / leverage
-    account = account_summary(store)
+    account = account_summary(store, marks)
     if margin + _fee(notional) > account["available"]:
         raise ValueError(
             f"可用余额不足：需要保证金 {margin:.2f} + 手续费 {_fee(notional):.2f}，"
             f"可用 {account['available']:.2f}")
 
     fee = _fee(notional)
+    stop = (price * (1 - stop_loss_pct / 100 if side == "long"
+                     else 1 + stop_loss_pct / 100)) if stop_loss_pct else None
     order_id = store.add_order(
         inst_id, side,
         contracts=notional / price, entry_price=price, notional=notional,
-        leverage=leverage, status="filled", reason="paper")
+        leverage=leverage, stop_price=stop, status="filled", reason="paper")
     # Equity already reflects the opening fee: position_unrealised deducts it.
     # Subtracting it again here would double-count.
     store.add_equity(account_summary(store)["equity"], note=f"open {side} {inst_id}")
@@ -82,8 +110,11 @@ def open_position(store, inst_id: str, side: str, notional: float,
             "leverage": leverage, "margin": margin, "fee": fee}
 
 
+@serialised
 def close_position(store, order_id: int, price: float) -> dict:
     """Close an open paper position at `price`. Returns realised PnL details."""
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("成交价格必须大于 0 且为有限数字")
     opens = {o["id"]: o for o in store.open_orders()}
     order = opens.get(order_id)
     if order is None:
@@ -92,7 +123,7 @@ def close_position(store, order_id: int, price: float) -> dict:
     direction = 1.0 if order["side"] == "long" else -1.0
     notional = order["notional"]
     gross = (price - order["entry_price"]) / order["entry_price"] * direction
-    fees = _fee(notional) * 2          # open + close
+    fees = _fee(notional) + _fee(notional * price / order["entry_price"])
     pnl = gross * notional - fees
     margin = notional / order["leverage"]
     pnl_pct = pnl / margin if margin else 0.0
@@ -120,6 +151,7 @@ def liquidation_price(order: dict) -> float:
     return order["entry_price"] * (1 + 1 / lev)
 
 
+@serialised
 def account_summary(store, marks: dict[str, float] | None = None,
                     exit_prices: dict[str, tuple] | None = None) -> dict:
     """balance / equity / margin / available, plus open positions marked to
@@ -131,9 +163,7 @@ def account_summary(store, marks: dict[str, float] | None = None,
     """
     marks = marks or {}
     exit_prices = exit_prices or {}
-    orders = store.orders(limit=1000)
-    realised = sum(o["pnl"] for o in orders
-                   if o["status"] == "closed" and o["pnl"] is not None)
+    realised = store.realised_pnl()
     balance = initial_balance(store) + realised
 
     margin_used = 0.0
