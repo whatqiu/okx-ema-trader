@@ -334,6 +334,9 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
                 "bar_ts": last_ts, "inst_id": inst_id, "adx": adx}
 
     side = signal.side
+    # Notify on the signal even if risk or position limits prevent a trade.
+    import notifications
+    notifications.enqueue(inst_id, side, last_ts, signal.reason)
     price_fn = price_fn or _spread_prices
     state = get_state(store)
     allow_open = allow_open and len(store.open_orders()) < state["max_positions"]

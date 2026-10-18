@@ -3,11 +3,10 @@
 // recent picks, and an offline-degraded list (source === 'local').
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from '../api'
+import { favorites, recentSymbols, rememberSymbol, toggleFavorite } from '../symbolLists'
 
 const props = defineProps({ modelValue: { type: String, default: '' } })
 const emit = defineEmits(['update:modelValue', 'select'])
-
-const RECENT_KEY = 'recentSymbols'
 
 const text = ref(props.modelValue)
 const open = ref(false)
@@ -17,25 +16,28 @@ const source = ref('okx')
 const highlight = ref(-1)
 const box = ref(null)
 let debounce = null
+let searchId = 0
 
 watch(() => props.modelValue, v => { text.value = v })
 
 function recents() {
-  try { return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]') } catch { return [] }
+  return recentSymbols.value
 }
 function pushRecent(sym) {
-  const list = [sym, ...recents().filter(s => s !== sym)].slice(0, 5)
-  localStorage.setItem(RECENT_KEY, JSON.stringify(list))
+  rememberSymbol(sym)
 }
 
 async function search(q) {
+  const id = ++searchId
   loading.value = true
   try {
     const data = await api.instruments(q)
+    if (id !== searchId) return
     items.value = data.rows
     source.value = data.source
     highlight.value = data.rows.length ? 0 : -1
   } catch {
+    if (id !== searchId) return
     items.value = []
   }
   loading.value = false
@@ -122,6 +124,10 @@ function fmtPrice(v) {
       <div v-for="(it, i) in items" :key="it.inst_id" class="dd-item"
            :class="{ hl: i === highlight }"
            @mousedown.prevent="pick(it)" @mouseenter="highlight = i">
+        <button class="favorite-star" :class="{ saved: favorites.includes(it.inst_id) }"
+                :aria-label="`${favorites.includes(it.inst_id) ? '取消收藏' : '收藏'} ${it.base}`"
+                :aria-pressed="favorites.includes(it.inst_id)"
+                @mousedown.stop.prevent @click.stop="toggleFavorite(it.inst_id)">{{ favorites.includes(it.inst_id) ? '★' : '☆' }}</button>
         <b>{{ it.base }}</b>
         <span class="dim">/ USDT 永续</span>
         <span class="dd-right">
@@ -142,6 +148,9 @@ function fmtPrice(v) {
 
 <style scoped>
 .picker { position: relative; }
+.favorite-star { border: 0; background: transparent; color: var(--tx-tertiary); cursor: pointer; min-width: 32px; min-height: 32px; font-size: var(--fs-lg); }
+.favorite-star.saved { color: var(--c-accent); }
+.favorite-star:focus-visible { outline: 2px solid var(--c-accent); }
 
 /* 搜索框：接入统一令牌，宽度给足以容纳 "BTC/USDT 永续" 这类文本 */
 .symbol-input {
@@ -170,7 +179,7 @@ function fmtPrice(v) {
   top: calc(100% + var(--sp-1));
   left: 0;
   z-index: var(--z-dropdown);
-  width: 380px;
+  width: min(440px, calc(100vw - 32px));
   max-height: 400px;
   overflow-y: auto;
   overscroll-behavior: contain;

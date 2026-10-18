@@ -26,6 +26,7 @@ platform/frontend/.vite/
 .workbuddy/
 .cleanup-backup/
 config/console.json
+config/email.local.json
 
 # Secrets live in ~/.okx/config.toml, never in this repo.
 # If you ever add one here, it is already ignored:

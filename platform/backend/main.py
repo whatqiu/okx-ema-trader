@@ -29,11 +29,13 @@ import market
 import paper
 import autotrader
 import health
+import notifications
 from okx_ema_trader.backtest import MINUTES_PER_BAR, simulate
 from okx_ema_trader.jsonio import json_safe as _json_safe
 from okx_ema_trader.symbols import SymbolError
 from okx_ema_trader.http import OkxError
 from okx_ema_trader.indicators import indicator_frame
+from okx_ema_trader.config import fixed_stop_pct
 
 _poller: market.MarketPoller | None = None
 _auto_stop = threading.Event()
@@ -283,6 +285,9 @@ async def lifespan(app: FastAPI):
         _watch(_inst, _boot_cfg.bar_15m, pin=True)
     _auto_stop.clear()
     _janitor_stop.clear()
+    email_thread = threading.Thread(target=notifications.run, args=(_auto_stop,),
+                                    daemon=True, name="signal-email")
+    email_thread.start()
     auto_thread = threading.Thread(target=_auto_loop, daemon=True,
                                    name="auto-trader")
     auto_thread.start()

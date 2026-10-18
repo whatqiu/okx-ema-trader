@@ -320,10 +320,14 @@
 @media (max-width: 960px) {
   .layout {
     grid-template-columns: 1fr;
-    grid-template-rows: auto auto auto;
+    grid-template-rows: repeat(3, max-content);
+    align-content: start;
     overflow-y: auto;
   }
   .layout__left, .layout__right { min-height: 0; }
+  .layout__center { grid-row: 1; }
+  .layout__left > .panel, .layout__right > .panel { flex: 0 0 auto; }
+  .layout__left .panel--fill, .layout__right .panel--fill { max-height: 400px; }
   .chart-card { min-height: 320px; }
   .quote__last { font-size: var(--fs-xl); }
 }

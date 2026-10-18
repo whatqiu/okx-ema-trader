@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from './api'
 import KlineChart from './components/KlineChart.vue'
 import SymbolPicker from './components/SymbolPicker.vue'
+import SymbolShortcuts from './components/SymbolShortcuts.vue'
+import { rememberSymbol } from './symbolLists'
 import EquityCurve from './components/v2/EquityCurve.vue'
 import PositionCard from './components/v2/PositionCard.vue'
 import SignalFeed from './components/v2/SignalFeed.vue'
@@ -251,7 +253,11 @@ function mergeRows(base, incoming) {
   return merged.length > maxRows ? merged.slice(-maxRows) : merged
 }
 
+let viewVersion = 0
 async function loadCandles(sync) {
+  const version = viewVersion
+  const inst = symbol.value
+  const timeframe = bar.value
   if (sync) {
     syncing.value = true
     candleExtent.value = null
@@ -261,11 +267,13 @@ async function loadCandles(sync) {
     const wasWarming = candleExtent.value?.warming === true
     if (sync) {
       data = await api.candles(
-        symbol.value, bar.value, historyLimit(bar.value), true)
+        inst, timeframe, historyLimit(timeframe), true)
+      if (version !== viewVersion) return
       rows.value = data.rows
     } else {
       const since = rows.value.length ? rows.value[rows.value.length - 1][0] : 0
-      data = await api.candles(symbol.value, bar.value, 600, false, since)
+      data = await api.candles(inst, timeframe, 600, false, since)
+      if (version !== viewVersion) return
       rows.value = mergeRows(rows.value, data.rows)
       // 增量响应故意只带最新几根，因此后台补入的更老历史不会通过
       // ``since`` 回来。预热完成的那个轮次只从本地完整读取一次，之后
@@ -273,19 +281,24 @@ async function loadCandles(sync) {
       if (wasWarming && !data.extent?.warming
           && rows.value.length < historyLimit(bar.value)) {
         data = await api.candles(
-          symbol.value, bar.value, historyLimit(bar.value), false)
+          inst, timeframe, historyLimit(timeframe), false)
+        if (version !== viewVersion) return
         rows.value = data.rows
       }
     }
     candleExtent.value = data.extent
     lastUpdate.value = Date.now()
   }, true)
-  if (sync) syncing.value = false
+  if (sync && version === viewVersion) syncing.value = false
 }
 
 async function loadTicker() {
+  const version = viewVersion
+  const inst = symbol.value
   await guard(async () => {
-    ticker.value = await api.ticker(symbol.value)
+    const data = await api.ticker(inst)
+    if (version !== viewVersion) return
+    ticker.value = data
     mergeTickIntoCandle()
   }, true)
 }
@@ -317,6 +330,7 @@ function mergeTickIntoCandle() {
 }
 
 async function loadPanels() {
+  const version = viewVersion
   await guard(async () => {
     const [s, o, b, st, eq, acc, slog] = await Promise.all([
       api.signals(symbol.value, 50), api.orders({ symbol: symbol.value, limit: 50 }),
@@ -325,6 +339,7 @@ async function loadPanels() {
       // 不过滤：扫描器监控多个币种，按图表币种过滤会隐藏其他币的信号
       api.signals(null, 200),
     ])
+    if (version !== viewVersion) return
     signals.value = s.rows
     signalLog.value = slog.rows
     orders.value = o.rows
@@ -333,28 +348,47 @@ async function loadPanels() {
     equityRows.value = eq.rows
     account.value = acc
     const at = await api.autotrade()
+    if (version !== viewVersion) return
     auto.value = at
     syncAutoFields(at)
   }, true)
 }
 
 async function loadOrders() {
+  const version = viewVersion
   await guard(async () => {
     const data = await api.orders({
       symbol: ordOnlyCurrent.value ? symbol.value : undefined,
       status: ordStatus.value || undefined,
       limit: 300,
     })
+    if (version !== viewVersion) return
     historyOrders.value = data.rows
   }, true)
 }
 
 async function applySymbol() {
+  const version = ++viewVersion
+  rememberSymbol(symbol.value)
+  rows.value = []
+  ticker.value = null
+  signals.value = []
+  orders.value = []
+  backtests.value = []
+  historyOrders.value = []
+  lastUpdate.value = null
   localStorage.setItem('symbol', symbol.value)
   localStorage.setItem('bar', bar.value)
   await loadCandles(true)
+  if (version !== viewVersion) return
   await Promise.all([loadTicker(), loadPanels()])
   if (workTab.value === 'history') await loadOrders()
+}
+
+function selectShortcut(value) {
+  if (symbol.value === value) return
+  symbol.value = value
+  applySymbol()
 }
 
 // 市价单的实际成交价：多头吃卖一，空头吃买一。
@@ -614,6 +648,8 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
                 :aria-expanded="showSettings" @click="showSettings = !showSettings">⚙</button>
       </div>
     </header>
+
+    <SymbolShortcuts :symbol="symbol" @select="selectShortcut" />
 
     <!-- 断网横幅：持续显示时长 + 原因。
          断线不能看起来像"行情平静"——用户会据此做决策。 -->
