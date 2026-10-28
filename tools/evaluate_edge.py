@@ -80,9 +80,13 @@ def run(inst: str, conn, cfg, stop_pct: float, cost_bps: float,
         return None
     f5 = indicator_frame(c5, cfg.ema_fast, cfg.ema_slow, cfg.adx_period)
     f15 = indicator_frame(c15, cfg.ema_fast, cfg.ema_slow, cfg.adx_period)
+    exit_options = dict(
+        leverage=cfg.trading.leverage,
+        liquidation_buffer_pct=cfg.trading.liquidation_buffer_pct
+        if cfg.trading.exit_mode == "liquidation" and stop_pct == 0 else 0)
     if entry is None:
         rep = simulate(f5, f15, cfg.adx_min, cfg.deviation_max,
-                       cost_bps, LOOKAHEAD_MS, stop_pct)
+                       cost_bps, LOOKAHEAD_MS, stop_pct, **exit_options)
     else:
         # Swap the entry rule ONLY. Everything else — fills, costs, the stop,
         # the 15m environment — is the same code, so a difference in the result
@@ -91,7 +95,7 @@ def run(inst: str, conn, cfg, stop_pct: float, cost_bps: float,
         backtest.evaluate_signal = entry
         try:
             rep = simulate(f5, f15, cfg.adx_min, cfg.deviation_max,
-                           cost_bps, LOOKAHEAD_MS, stop_pct)
+                           cost_bps, LOOKAHEAD_MS, stop_pct, **exit_options)
         finally:
             backtest.evaluate_signal = original
     return _stats(inst, rep, stop_pct, cost_bps)

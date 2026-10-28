@@ -12,6 +12,8 @@ import { computed } from 'vue'
 const props = defineProps({
   position: { type: Object, required: true },
   busy: { type: Boolean, default: false },
+  exitMode: { type: String, default: 'fixed' },
+  bufferPct: { type: Number, default: 3 },
 })
 
 const emit = defineEmits(['close'])
@@ -127,7 +129,8 @@ function fmtTime(ts) {
     <footer class="pos__foot">
       <span class="num">名义 {{ fmtUsd(position.notional) }}</span>
       <span class="num">保证金 {{ fmtUsd(position.margin) }}</span>
-      <span v-if="position.stop_price" class="num">止损 {{ fmtNum(position.stop_price) }}</span>
+      <span v-if="exitMode === 'liquidation'" class="num">距强平 ≤ {{ bufferPct }}% 退出</span>
+      <span v-else-if="position.stop_price" class="num">止损 {{ fmtNum(position.stop_price) }}</span>
       <span class="num tone-dim">{{ fmtTime(position.opened_at) }}</span>
       <button class="btn btn--danger pos__close"
               :disabled="busy" @click="emit('close', position)">

@@ -183,6 +183,39 @@ def test_unrealised_uses_mark_price():
     store.close(); tmp.cleanup()
 
 
+def test_open_equity_snapshot_preserves_other_positions_marks():
+    store, tmp = fresh_store()
+    try:
+        paper.open_position(store, INST, "long", 1000.0, 10.0, 100.0)
+        marks = {INST: 80.0}
+        paper.open_position(store, "BTC-USDT-SWAP", "long", 500.0, 5.0,
+                            50.0, marks=marks)
+        snapshot = store.equity_series()[-1]["equity"]
+        check(close(snapshot, 9799.25),
+              f"opening erased another position's loss: {snapshot}")
+    finally:
+        store.close(); tmp.cleanup()
+
+
+def test_close_equity_snapshot_preserves_remaining_positions_marks():
+    for mark in (80.0, 120.0):
+        store, tmp = fresh_store()
+        try:
+            paper.open_position(store, INST, "long", 1000.0, 10.0, 100.0)
+            opened = paper.open_position(store, "BTC-USDT-SWAP", "long",
+                                         500.0, 5.0, 50.0)
+            marks = {INST: mark, "BTC-USDT-SWAP": 55.0}
+            before = paper.account_summary(store, marks)["equity"]
+            paper.close_position(store, opened["order_id"], 55.0, marks=marks)
+            snapshot = store.equity_series()[-1]["equity"]
+            check(close(before - snapshot, 0.275),
+                  f"close changed equity beyond its closing fee: {before - snapshot}")
+            check(close(snapshot, paper.account_summary(store, marks)["equity"]),
+                  "stored equity differs from marked account")
+        finally:
+            store.close(); tmp.cleanup()
+
+
 TESTS = [value for name, value in sorted(globals().items())
          if name.startswith("test_") and callable(value)]
 

@@ -33,7 +33,7 @@ from pathlib import Path
 
 from . import http
 from .broker import Broker, BrokerError
-from .config import Config, TradingConfig, load_config
+from .config import Config, TradingConfig, load_config, sizing_exit_distance_pct, fixed_stop_pct
 from .credentials import CredentialsError, load_demo_credentials
 from .history import fetch_candles
 from .indicators import calculate_indicators
@@ -94,7 +94,7 @@ def exposure_for(trading: TradingConfig, equity: float) -> float:
     """
     if trading.sizing_mode == "risk":
         return equity * (trading.risk_per_trade_pct / 100.0) / (
-            trading.stop_loss_pct / 100.0)
+            sizing_exit_distance_pct(trading) / 100.0)
     if trading.sizing_mode == "equity":
         return equity * (trading.equity_pct / 100.0) * trading.leverage
     return trading.notional_usdt * trading.leverage
@@ -123,6 +123,7 @@ class Executor:
         """Compare the ledger against the exchange. Any mismatch is fatal."""
         self._equity = self.broker.verify_demo()
         problems: list[str] = []
+        actual_positions = {}
 
         for symbol in self.trading.symbols:
             booked = self.ledger.get(symbol)
@@ -134,6 +135,7 @@ class Executor:
 
             live_side = "flat"
             if actual is not None:
+                actual_positions[symbol] = actual
                 raw_side = (actual.get("side") or "").lower()
                 live_side = "long" if raw_side == "long" else "short"
 
@@ -153,11 +155,32 @@ class Executor:
             )
             raise SystemExit(2)
 
+        if self.trading.exit_mode == "liquidation" and not self.dry_run:
+            from .liquidation import distance_pct
+            for symbol, actual in actual_positions.items():
+                booked = self.ledger.get(symbol)
+                if not booked.stop_order_id:
+                    continue
+                info = actual.get("info") or {}
+                try:
+                    distance = distance_pct(
+                        booked.side, float(actual.get("markPrice") or info.get("markPx") or 0),
+                        float(actual.get("liquidationPrice") or info.get("liqPx") or 0))
+                except ValueError as exc:
+                    raise BrokerError(f"{symbol}: 无法读取强平价，保留旧保护单并暂停启动") from exc
+                if distance <= self.trading.liquidation_buffer_pct:
+                    continue  # The first risk pass closes it; keep protection until then.
+                self.broker.cancel_fixed_stop(symbol, booked.stop_order_id)
+                booked.stop_order_id = ""
+                booked.stop_price = 0.0
+                self.ledger.set(symbol, booked)
+                self.ledger.save()
+
         logging.info("reconciled %d symbol(s) | equity=%.2f USDT",
                      len(self.trading.symbols), self._equity)
 
     # --------------------------------------------------------------- one cycle
-    def poll(self) -> None:
+    def poll(self, *, evaluate_signals: bool = True) -> None:
         # 风控在策略之前：熔断触发时连 K 线都不用看，这一轮的目标是把仓位平
         # 掉，而不是找下一个入场点。
         decision = self.guard.check()
@@ -171,6 +194,8 @@ class Executor:
                 "--reset-halt，或手改 %s 的 risk 段", decision.reason, self.ledger.path)
             return
 
+        if not evaluate_signals:
+            return
         for symbol in self.trading.symbols:
             if self.ledger.risk.halted:
                 break
@@ -388,7 +413,7 @@ class Executor:
         effective = self.broker.set_leverage(symbol, self.trading.leverage)
         fill = self.broker.market_entry(
             symbol, signal.side, exposure / max(self.trading.leverage, 1),
-            effective, self.trading.stop_loss_pct,
+            effective, fixed_stop_pct(self.trading),
             client_id=f"{symbol.split('-')[0]}{int(time.time())}",
             take_profit_pct=self.trading.take_profit_pct,
         )
@@ -493,15 +518,19 @@ def main() -> None:
         logging.error("credentials: %s", exc)
         raise SystemExit(1)
 
+    next_signal_at = 0.0
     while True:
         try:
-            executor.poll()
+            evaluate_signals = time.time() >= next_signal_at
+            executor.poll(evaluate_signals=evaluate_signals)
+            if evaluate_signals:
+                next_signal_at = time.time() + seconds_until_next_bar()
         except Exception:
             logging.exception("cycle failed; will retry")
         if args.once:
             return
         try:
-            time.sleep(seconds_until_next_bar())
+            time.sleep(5.0)
         except KeyboardInterrupt:
             logging.info("stopped")
             return

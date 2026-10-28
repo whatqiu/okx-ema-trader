@@ -184,6 +184,7 @@ class RiskLimits:
 
     enabled: bool = True
     max_loss_pct: float = 60.0      # of position margin
+    price_stop_enabled: bool = True
     max_drawdown_pct: float = 0.0   # of account equity; 0 disables
     max_consecutive_losses: int = 0  # 0 disables
     # Close when the mark is within this many PERCENT of the liquidation price.
@@ -371,21 +372,22 @@ def evaluate_risk(positions: list[dict], *, equity: float, baseline: float,
     for p in positions:
         stop = p.get("stop_price")
         mark = p.get("mark_price")
-        if stop and mark and ((p["side"] == "long" and mark <= stop)
+        if limits.price_stop_enabled and stop and mark and ((p["side"] == "long" and mark <= stop)
                               or (p["side"] == "short" and mark >= stop)):
             condemned[p["id"]] = f"price-stop:{p.get('inst_id')}"
         margin = float(p.get("margin") or 0.0)
         if margin <= 0:
             continue
         loss_pct = -float(p.get("unrealised_pnl") or 0.0) / margin * 100.0
-        if loss_pct > limits.max_loss_pct:
+        if limits.max_loss_pct > 0 and loss_pct > limits.max_loss_pct:
             condemned[p["id"]] = f"position-stop:{p.get('inst_id')}"
         # 2. Liquidation proximity. At 5x the liq price is 20% away; a mark
         #    within a few percent of it means the position is nearly dead.
         liq = p.get("liq_price")
         mark = p.get("mark_price")
         if liq and mark:
-            distance = abs(float(mark) - float(liq)) / abs(float(liq)) * 100.0
+            from okx_ema_trader.liquidation import distance_pct
+            distance = distance_pct(p.get("side", "long"), float(mark), float(liq))
             if distance <= limits.liq_buffer_pct:
                 condemned[p["id"]] = f"liquidation-risk:{p.get('inst_id')}"
 
@@ -543,7 +545,10 @@ def enforce_risk(store, *, limits: RiskLimits, marks: dict | None = None,
                 {"id": p.get("id"), "error": f"{p.get('inst_id')} 没有可用价格，无法平仓"})
             continue
         try:
-            out = paper.close_position(store, p["id"], price)
+            marks = {pos["inst_id"]: pos["mark_price"] for pos in positions
+                     if pos.get("mark_price") is not None}
+            out = paper.close_position(store, p["id"], price, reason=decision.reason,
+                                       marks=marks)
             report["closed"].append({"id": p["id"], "pnl": out["pnl"],
                                      "reason": decision.reason})
         except Exception as exc:

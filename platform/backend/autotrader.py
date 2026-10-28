@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from dataclasses import asdict
 
 import deps
 import health
@@ -37,7 +38,10 @@ import market
 import paper
 from okx_ema_trader.backtest import MINUTES_PER_BAR
 from okx_ema_trader.indicators import indicator_frame
-from okx_ema_trader.strategy import PullbackEntry, evaluate_signal
+from okx_ema_trader.strategy import (PullbackEntry, evaluate_signal, evaluate_trend,
+                                   evaluate_wave, profit_trailing_exit,
+                                   classify, classify_trend, trend_reversed)
+from okx_ema_trader.config import fixed_stop_pct, paper_liquidation_buffer, paper_strategy_for
 
 _DEFAULTS = {"enabled": "0", "symbol": "", "notional": "100", "leverage": "5"}
 
@@ -49,9 +53,11 @@ _DEFAULTS = {"enabled": "0", "symbol": "", "notional": "100", "leverage": "5"}
 _entry_rules: dict[str, object] = {}
 
 
-def _entry_rule(inst_id: str = ""):
+def _entry_rule(inst_id: str = "", store=None):
     """Return this symbol's entry rule, honouring `entry_mode` in config."""
     cfg = deps.config()
+    if paper_strategy_for(cfg, store).entry_mode in ('trend', 'wave'):
+        return evaluate_trend
     if cfg.entry_mode != "pullback":
         return evaluate_signal
     rule = _entry_rules.get(inst_id)
@@ -139,11 +145,17 @@ def get_state(store) -> dict:
         # this, an empty `signals` table cannot distinguish "the strategy never
         # triggers" from "the loop never ran".
         "scan": scan,
+        "strategy": asdict(paper_strategy_for(deps.config(), store)),
+        "strategy_profile": store.get_meta('paper_strategy_profile', 'configured'),
     }
 
 
+@paper.serialised
 def set_state(store, *, enabled=None, symbol=None, symbols=None, notional=None,
-              leverage=None, max_positions=None) -> dict:
+              leverage=None, max_positions=None, strategy_profile=None) -> dict:
+    if strategy_profile is not None:
+        if strategy_profile not in ('legacy', 'trend-v1', 'wave-v1'):
+            raise ValueError('strategy_profile must be legacy, trend-v1 or wave-v1')
     if enabled is not None:
         store.set_meta("auto_enabled", "1" if enabled else "0")
     if symbols is not None:
@@ -181,6 +193,8 @@ def set_state(store, *, enabled=None, symbol=None, symbols=None, notional=None,
         if not (1 <= int(max_positions) <= MAX_SYMBOLS):
             raise ValueError(f"最大持仓数必须在 1–{MAX_SYMBOLS} 之间")
         store.set_meta("auto_max_positions", str(int(max_positions)))
+    if strategy_profile is not None:
+        store.set_meta('paper_strategy_profile', strategy_profile)
     return get_state(store)
 
 
@@ -233,7 +247,8 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
     opposite position is allowed under both: reducing risk never needs
     permission.
     """
-    signal_fn = signal_fn or _entry_rule(inst_id)
+    injected = signal_fn is not None
+    signal_fn = signal_fn or _entry_rule(inst_id, store)
     cfg = deps.config()
     bar5 = cfg.bar_5m
     bar15 = cfg.bar_15m
@@ -314,36 +329,123 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
     if p15 is not None:
         ind_15m["prev_ema_fast"] = float(p15["ema_fast"])
         ind_15m["prev_ema_slow"] = float(p15["ema_slow"])
-    signal = signal_fn(
-        {"close": float(r5["close"]), "high": float(r5["high"]),
+    ind_5m = {"close": float(r5["close"]), "high": float(r5["high"]),
          "low": float(r5["low"]),
          "ema_fast": float(r5["ema_fast"]),
          "ema_slow": float(r5["ema_slow"]),
          "prev_ema_fast": float(p5["ema_fast"]),
-         "prev_ema_slow": float(p5["ema_slow"])},
-        ind_15m,
+         "prev_ema_slow": float(p5["ema_slow"])}
+    signal = signal_fn(
+        ind_5m, ind_15m,
         cfg.adx_min, cfg.deviation_max,
     )
+
+    profile = paper_strategy_for(cfg, store)
+    env = 'long' if r15['ema_fast'] > r15['ema_slow'] else ('short' if r15['ema_fast'] < r15['ema_slow'] else 'flat')
+    regime_key = f'auto_trend_regime:{inst_id}'
+    regime = store.get_meta(regime_key, '')
+    if not regime.startswith(env + ':'):
+        regime = f'{env}:{int(r15["ts"])}'
+        store.set_meta(regime_key, regime)
+    count_key = f'auto_trend_count:{inst_id}'
+    count_state = json.loads(store.get_meta(count_key, '{}'))
+    count = int(count_state.get('count', 0)) if count_state.get('regime') == regime else 0
+    if not count and store.get_meta(f'auto_trend_entered:{inst_id}', '') == regime:
+        count = 1
+    if profile.entry_mode == 'wave' and count > 0 and not injected:
+        signal = evaluate_wave(ind_5m, ind_15m, cfg.adx_min, cfg.deviation_max)
+
+    # Exit stale exposure independently of the filters for a NEW entry.
+    early_closed = []
+    if profile.exit_on_trend_reversal or profile.profit_trail_activation_pct > 0:
+        exits = []
+        for o in store.open_orders(inst_id):
+            why = ''
+            if profile.profit_trail_activation_pct > 0:
+                peak_key = f'auto_profit_peak:{o["id"]}'
+                peak, trailing = profit_trailing_exit(
+                    o['side'], o['entry_price'], float(store.get_meta(peak_key, str(o['entry_price']))),
+                    ind_5m['close'], profile.profit_trail_activation_pct, profile.profit_trail_distance_pct)
+                store.set_meta(peak_key, str(peak))
+                if trailing:
+                    why = 'profit-trail'
+            if profile.exit_on_trend_reversal and trend_reversed(o['side'], ind_5m, ind_15m):
+                why = 'trend-reversal'
+            if why:
+                exits.append((o, why))
+        if exits:
+            prices = (price_fn or _spread_prices)(store, inst_id, ticker_fn)
+            for o, why in exits:
+                out = paper.close_position(store, o['id'], prices['bid'] if o['side'] == 'long' else prices['ask'],
+                                           reason=why)
+                early_closed.append({'id':o['id'], 'pnl':out['pnl']})
+            store.add_signal(inst_id, env, 'exit: ' + ', '.join(sorted({why for _, why in exits})),
+                             ts=last_ts, acted=True, adx=adx)
+            if risk_check_fn is not None:
+                try:
+                    risk_check_fn(store)
+                except Exception:
+                    health.set_risk_halt(store, '平仓后风控检查失败，请检查行情和账户')
+                    raise
+            halted = halted or health.risk_halted(store)
+
+    if signal is not None and profile.max_entries_per_trend and count >= profile.max_entries_per_trend:
+        if not store.open_orders(inst_id):
+            _record_scan(store, inst_id, ts=last_ts, side=signal.side, acted=bool(early_closed), adx=adx,
+                         why=f'本轮趋势已开仓 {count} 次，等待新的 15m 趋势')
+            return {'acted':bool(early_closed), 'why':'trend entry limit', 'closed':early_closed, 'inst_id':inst_id}
+
+    if signal is not None and profile.one_entry_per_trend:
+        if store.get_meta(f'auto_trend_entered:{inst_id}', '') == regime and not store.open_orders(inst_id):
+            _record_scan(store, inst_id, ts=last_ts, side=signal.side, acted=bool(early_closed), adx=adx,
+                         why='本轮趋势已交易，等待新的 15m 趋势')
+            return {'acted':bool(early_closed), 'why':'trend already traded', 'closed':early_closed, 'inst_id':inst_id}
+
+    if signal is not None and profile.reentry_cooldown_bars > 0:
+        last = store.latest_closed_order(inst_id)
+        if last:
+            if ((profile.entry_mode == 'wave' or (last['side'] == signal.side and (last.get('pnl') or 0) < 0))
+                    and last_ts + MINUTES_PER_BAR[bar5] * 60000 < (last.get('closed_at') or 0) + profile.reentry_cooldown_bars * MINUTES_PER_BAR[bar5] * 60000):
+                _record_scan(store, inst_id, ts=last_ts, side=signal.side, acted=bool(early_closed), adx=adx, why='平仓后冷却中，等待下一段波动')
+                return {'acted':bool(early_closed), 'why':'reentry cooldown', 'closed':early_closed, 'inst_id':inst_id}
 
     if signal is None:
         # Recorded, not swallowed. This is what turns an empty `signals` table
         # from "who knows" into "the strategy looked and said no, N times".
-        _record_scan(store, inst_id, ts=last_ts, side=None, acted=False, adx=adx,
-                     why="no signal — 空仓不操作")
-        return {"acted": False, "why": "no signal — 空仓不操作",
+        why = 'no signal — 空仓不操作'
+        if not injected and cfg.entry_mode != 'pullback':
+            _, why = (classify_trend if profile.entry_mode in ('trend', 'wave') else classify)(ind_5m, ind_15m, cfg.adx_min, cfg.deviation_max)
+            if profile.entry_mode == 'wave' and count > 0 and why in ('long', 'short'):
+                why = '等待回调或反弹触及均线，并在收盘时确认趋势恢复'
+            why = {
+                'adx_too_low': f'15m ADX {adx:.1f}，未超过 {cfg.adx_min:g}，等待趋势增强',
+                'deviation_too_large': f'15m 偏离 {abs(ind_15m["close"] / ind_15m["ema_fast"] - 1) * 100:.2f}%，超过 {cfg.deviation_max * 100:g}%，等待回调',
+                '5m_not_aligned': '5m 尚未确认同向动量，继续等待',
+                'no_cross_event': '本根 K 线未出现同向交叉或趋势转向',
+                'no_trend_env': '15m 均线尚无明确方向',
+                'warmup': '等待指标预热完成',
+            }.get(why, why)
+        _record_scan(store, inst_id, ts=last_ts, side=None, acted=bool(early_closed), adx=adx,
+                     why=why)
+        return {"acted": bool(early_closed), "why": why, 'closed':early_closed,
                 "bar_ts": last_ts, "inst_id": inst_id, "adx": adx}
 
     side = signal.side
-    # Notify on the signal even if risk or position limits prevent a trade.
-    import notifications
-    notifications.enqueue(inst_id, side, last_ts, signal.reason)
     price_fn = price_fn or _spread_prices
     state = get_state(store)
-    allow_open = allow_open and len(store.open_orders()) < state["max_positions"]
+    allow_open = (allow_open or bool(early_closed)) and len(store.open_orders()) < state["max_positions"]
 
     opens = store.open_orders(inst_id)
     same = [o for o in opens if o["side"] == side]
     opposite = [o for o in opens if o["side"] != side]
+    if profile.entry_mode in ('trend', 'wave') and same:
+        store.set_meta(f'auto_trend_entered:{inst_id}', regime)
+        store.set_meta(count_key, json.dumps({'regime':regime, 'count':max(1,count)}))
+        _record_scan(store, inst_id, ts=last_ts, side=side, acted=bool(early_closed), adx=adx,
+                     why='趋势持续，持有同向仓位，不重复加仓')
+        return {'acted':bool(early_closed), 'why':'same-side position held', 'signal':side, 'closed':early_closed, 'inst_id':inst_id}
+    import notifications
+    notifications.enqueue(inst_id, side, last_ts, signal.reason)
 
     # Skipped only when there is nothing to reduce AND nothing may be added. A
     # pending reversal still has to reach the block below so its close half can
@@ -355,19 +457,20 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
         else:
             why = f"持仓已达上限 {state['max_positions']}，跳过开仓"
             out_why = "at position cap"
-        _record_scan(store, inst_id, ts=last_ts, side=side, acted=False, adx=adx,
+        _record_scan(store, inst_id, ts=last_ts, side=side, acted=bool(early_closed), adx=adx,
                      why=why)
-        return {"acted": False, "why": out_why, "signal": side,
+        store.add_signal(inst_id, side, why, ts=last_ts, acted=False, adx=adx)
+        return {"acted": bool(early_closed), "why": out_why, "signal": side, 'closed':early_closed,
                 "bar_ts": last_ts, "inst_id": inst_id, "halted": halted}
 
-    closed, opened = [], None
+    closed, opened = list(early_closed), None
     try:
         # Price fetch is INSIDE the try: a dead proxy or a missing bid/ask
         # must be recorded for the UI, not thrown through the caller.
         prices = price_fn(store, inst_id, ticker_fn)
         for o in opposite:
             exit_price = prices["bid"] if o["side"] == "long" else prices["ask"]
-            out = paper.close_position(store, o["id"], exit_price)
+            out = paper.close_position(store, o["id"], exit_price, reason='signal-reversal')
             closed.append({"id": o["id"], "pnl": out["pnl"]})
         if closed and risk_check_fn is not None:
             try:
@@ -380,7 +483,11 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
             entry = prices["ask"] if side == "long" else prices["bid"]
             opened = paper.open_position(store, inst_id, side,
                                          state["notional"], state["leverage"],
-                                         entry, stop_loss_pct=cfg.trading.stop_loss_pct)
+                                         entry, stop_loss_pct=fixed_stop_pct(cfg.trading),
+                                         liquidation_buffer_pct=paper_liquidation_buffer(cfg, store)
+                                         if cfg.trading.exit_mode == "liquidation" else 0)
+            store.set_meta(f'auto_trend_entered:{inst_id}', regime)
+            store.set_meta(count_key, json.dumps({'regime':regime, 'count':count+1}))
         acted = opened is not None or bool(closed)
         store.add_signal(inst_id, side, f"auto: {signal.reason}",
                          price=prices.get("last"), ema_fast=float(r5["ema_fast"]),

@@ -24,6 +24,7 @@ async function request(path, options = {}) {
 export const api = {
   // Liveness of this process only (never upstream state) — see backend note.
   health: () => request('/api/health'),
+  rankings: () => request('/api/market/rankings'),
   // Upstream connectivity + the circuit breaker: "can we still see the market".
   status: () => request('/api/status'),
   riskCheck: () => request('/api/risk/check', { method: 'POST' }),

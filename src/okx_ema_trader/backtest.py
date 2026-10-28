@@ -33,7 +33,8 @@ import numpy as np
 from . import http
 from .config import load_config
 from .indicators import indicator_frame
-from .strategy import evaluate_signal
+from .strategy import (evaluate_signal, evaluate_trend, evaluate_wave, trend_reversed,
+                       profit_trailing_exit, PullbackEntry)
 
 # `/market/candles` only looks back ~1440 bars and returns an empty page the
 # moment you pass `after`, which silently truncated a 60-day request to 5 days.
@@ -204,6 +205,14 @@ def simulate(
     cost_per_unit_bps: float,
     lookahead_ms: int,
     stop_loss_pct: float,
+    *, liquidation_buffer_pct: float = 0.0, leverage: float = 1.0,
+    entry_mode: str = 'crossover', exit_on_trend_reversal: bool = False,
+    reentry_cooldown_bars: int = 0,
+    one_entry_per_trend: bool = False,
+    pullback_tolerance: float = 0.002,
+    max_entries_per_trend: int = 0,
+    profit_trail_activation_pct: float = 0.0,
+    profit_trail_distance_pct: float = 0.0,
 ) -> Report:
     """Replay the live strategy by CALLING it, not by re-describing it.
 
@@ -248,6 +257,26 @@ def simulate(
     stopped_out = 0
     unfilled = 0
     pending: tuple[str, int] | None = None  # (side, bar index that signalled it)
+    if entry_mode not in ('crossover', 'trend', 'pullback', 'wave'):
+        raise ValueError('simulate entry_mode must be crossover, trend, pullback or wave')
+    if reentry_cooldown_bars < 0:
+        raise ValueError('reentry_cooldown_bars must be nonnegative')
+    if max_entries_per_trend < 0:
+        raise ValueError('max_entries_per_trend must be nonnegative')
+    a, d = profit_trail_activation_pct, profit_trail_distance_pct
+    if not (np.isfinite(a) and np.isfinite(d)) or not (a == d == 0 or 0 < d < a < 100):
+        raise ValueError('profit trailing requires 0 < distance < activation < 100, or both zero')
+    cooldown = {'long': 0, 'short': 0}
+    entry_rule = evaluate_trend if entry_mode in ('trend', 'wave') else evaluate_signal
+    if entry_mode == 'pullback':
+        if not 0 < pullback_tolerance < .1:
+            raise ValueError('pullback_tolerance must be in (0, 0.1)')
+        entry_rule = PullbackEntry(tolerance=pullback_tolerance)
+    regime = None
+    regime_used = False
+    regime_entries = 0
+    profit_peak = 0.0
+    pending_exit_reason = 'trend-reversal'
 
     # Start at 1: a crossover needs the previous bar, so bar 0 can never enter.
     for index in range(1, len(frame_5m)):
@@ -257,7 +286,7 @@ def simulate(
         if pending is not None:
             side_name, signal_index = pending
             pending = None
-            side = 1 if side_name == "long" else -1
+            side = 0 if side_name == 'flat' else (1 if side_name == "long" else -1)
             fill = float(opens[index])
 
             if position != 0 and side != position:
@@ -269,17 +298,30 @@ def simulate(
                     "long" if position == 1 else "short",
                     int(entry_signal_ts), int(entry_exec_ts), float(entry_price),
                     int(ts_5m[signal_index]), int(ts_5m[index]), fill,
-                    float(gross), "signal"))
+                    float(gross), pending_exit_reason if side == 0 else "signal"))
+                if entry_mode == 'wave' or gross - 2 * cost < 0:
+                    until = int(ts_5m[index]) + reentry_cooldown_bars * lookahead_ms
+                    if entry_mode == 'wave':
+                        cooldown = {'long':until, 'short':until}
+                    else:
+                        cooldown['long' if position == 1 else 'short'] = until
                 equity_curve.append(equity)
                 position = 0
 
-            if position == 0:
+            if position == 0 and side != 0:
                 position = side
+                regime_used = True
+                regime_entries += 1
                 entry_price = fill
+                profit_peak = fill
                 entry_signal_ts = int(ts_5m[signal_index])
                 entry_exec_ts = int(ts_5m[index])
                 stop_price = (entry_price * (1 - stop_loss_pct / 100.0) if side == 1
                               else entry_price * (1 + stop_loss_pct / 100.0))
+                if liquidation_buffer_pct > 0:
+                    from .liquidation import buffer_price
+                    stop_price = buffer_price(entry_price, side_name, leverage,
+                                              liquidation_buffer_pct)
                 equity -= cost
                 turnover += 1.0
                 equity_curve.append(equity)
@@ -291,7 +333,8 @@ def simulate(
         if position != 0:
             low, high = float(lows[index]), float(highs[index])
             open_ = float(opens[index])
-            hit = low <= stop_price if position == 1 else high >= stop_price
+            hit = (low <= stop_price if position == 1 else high >= stop_price) \
+                if stop_loss_pct > 0 or liquidation_buffer_pct > 0 else False
             if hit:
                 # A gap through the stop fills at the open, not at the stop price.
                 fill = min(stop_price, open_) if position == 1 else max(stop_price, open_)
@@ -307,6 +350,11 @@ def simulate(
                 equity_curve.append(equity)
                 position = 0
                 stopped_out += 1
+                until = int(ts_5m[index]) + reentry_cooldown_bars * lookahead_ms
+                if entry_mode == 'wave':
+                    cooldown = {'long':until, 'short':until}
+                else:
+                    cooldown[trades[-1].side] = until
 
         # --- 2b) Mark-to-market sample, taken on EVERY bar.
         # Sampling only on trade exits (the old behaviour) measures the
@@ -325,7 +373,8 @@ def simulate(
         # --- 3) Entry decision. Closed 5m bar, and the 15m bar closed by then.
         cutoff = usable_until[index] - 15 * 60_000
         j = int(np.searchsorted(ts_15m, cutoff, side="right")) - 1
-        if j < 1:
+        if (j < 1 or ts_5m[index] < frame_5m.attrs.get('warmup_until_ts', float('-inf'))
+                or ts_15m[j] < frame_15m.attrs.get('warmup_until_ts', float('-inf'))):
             continue  # not enough 15m history yet
 
         row_5m = frame_5m.iloc[index]
@@ -338,8 +387,7 @@ def simulate(
         if np.isnan(prev_5m["ema_fast"]) or np.isnan(prev_5m["ema_slow"]):
             continue
 
-        signal = evaluate_signal(
-            {
+        ind5 = {
                 "close": float(row_5m["close"]),
                 "high": float(row_5m["high"]),
                 "low": float(row_5m["low"]),
@@ -347,16 +395,37 @@ def simulate(
                 "ema_slow": float(row_5m["ema_slow"]),
                 "prev_ema_fast": float(prev_5m["ema_fast"]),
                 "prev_ema_slow": float(prev_5m["ema_slow"]),
-            },
-            {
+            }
+        prev_15m = frame_15m.iloc[j - 1]
+        ind15 = {
                 "close": float(row_15m["close"]),
                 "ema_fast": float(row_15m["ema_fast"]),
                 "ema_slow": float(row_15m["ema_slow"]),
                 "adx": float(row_15m["adx"]),
-            },
-            adx_min,
-            deviation_max,
-        )
+                "prev_ema_fast": float(prev_15m["ema_fast"]),
+                "prev_ema_slow": float(prev_15m["ema_slow"]),
+            }
+        env = 'long' if ind15['ema_fast'] > ind15['ema_slow'] else ('short' if ind15['ema_fast'] < ind15['ema_slow'] else None)
+        if env != regime:
+            regime, regime_used, regime_entries = env, False, 0
+        signal = (evaluate_wave if entry_mode == 'wave' and regime_entries > 0 else entry_rule)(ind5, ind15, adx_min, deviation_max)
+        if one_entry_per_trend and regime_used:
+            signal = None
+        if max_entries_per_trend and regime_entries >= max_entries_per_trend:
+            signal = None
+        trail_exit = False
+        if position != 0 and profit_trail_activation_pct > 0:
+            profit_peak, trail_exit = profit_trailing_exit(
+                'long' if position == 1 else 'short', entry_price, profit_peak,
+                float(closes[index]), profit_trail_activation_pct, profit_trail_distance_pct)
+        must_exit = (exit_on_trend_reversal and position != 0
+                     and trend_reversed('long' if position == 1 else 'short', ind5, ind15))
+        if signal is not None and int(ts_5m[index]) + lookahead_ms < cooldown[signal.side]:
+            signal = None
+        if trail_exit or (must_exit and (signal is None or entry_mode == 'wave')):
+            pending = ('flat', index)
+            pending_exit_reason = 'profit-trail' if trail_exit else 'trend-reversal'
+            continue
         if signal is None:
             continue
 
@@ -491,13 +560,19 @@ def main() -> None:
     stop_pct = args.stop_pct if args.stop_pct is not None \
         else config.trading.stop_loss_pct
     report = simulate(frame_5m, frame_15m, config.adx_min, config.deviation_max,
-                      cost_per_unit_bps, lookahead_ms, stop_pct)
+                      cost_per_unit_bps, lookahead_ms, stop_pct,
+                      liquidation_buffer_pct=config.trading.liquidation_buffer_pct
+                      if args.stop_pct is None and config.trading.exit_mode == "liquidation" else 0,
+                      leverage=config.trading.leverage)
 
     print("")
     print("=" * 58)
     print(f"  {symbol}  EMA{config.ema_fast}/{config.ema_slow}  ADX>{config.adx_min}  last {args.days}d")
+    exit_label = "off" if stop_pct <= 0 or stop_pct >= 100 else f"{stop_pct:.1f}%"
+    if args.stop_pct is None and config.trading.exit_mode == "liquidation":
+        exit_label = f"liquidation-buffer {config.trading.liquidation_buffer_pct}%"
     print(f"  deviation<={config.deviation_max:.2%} on 15m   "
-          f"stop={'off' if stop_pct >= 100 else f'{stop_pct:.1f}%'}")
+          f"exit={exit_label}")
     print("=" * 58)
     if not report.trades:
         print("  no completed round trips — strategy stayed flat the whole window")

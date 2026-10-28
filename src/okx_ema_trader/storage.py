@@ -333,6 +333,13 @@ class Store:
             return [dict(r) for r in conn.execute(
                 sql + " ORDER BY created_at DESC LIMIT ?", [*params, int(limit)])]
 
+    def latest_closed_order(self, inst_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM orders WHERE inst_id=? AND status='closed' "
+                "ORDER BY closed_at DESC, id DESC LIMIT 1", (inst_id,)).fetchone()
+        return dict(row) if row else None
+
     def realised_pnl(self) -> float:
         """Lifetime PnL, including closed orders archived by retention."""
         with self._connect() as conn:

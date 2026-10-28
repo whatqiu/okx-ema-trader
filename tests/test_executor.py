@@ -266,7 +266,9 @@ def test_config_values() -> int:
     from okx_ema_trader.config import account_risk_per_trade_pct
     if config.trading.leverage != 20 or config.trading.sizing_mode != "risk" \
             or config.trading.risk_per_trade_pct != 1.0 \
-            or config.trading.stop_loss_pct != 2.0 \
+            or config.trading.stop_loss_pct != 0.0 \
+            or config.trading.exit_mode != "liquidation" \
+            or config.trading.liquidation_buffer_pct != 3.0 \
             or config.trading.take_profit_pct != 0.0:
         print("  FAIL risk parameters changed: "
               f"mode={config.trading.sizing_mode} lev={config.trading.leverage} "

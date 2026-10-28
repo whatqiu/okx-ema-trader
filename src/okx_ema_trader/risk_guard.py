@@ -64,6 +64,7 @@ class GuardLimits:
     max_consecutive_losses: int = 3
     # 单个仓位浮亏占权益的上限（%）。
     max_position_loss_pct: float = 30.0
+    liquidation_buffer_pct: float = 0.0
 
     @classmethod
     def for_trading(cls, trading: TradingConfig,
@@ -86,8 +87,10 @@ class GuardLimits:
             if risk is None or risk.max_drawdown_pct is None else risk.max_drawdown_pct,
             max_consecutive_losses=defaults.max_consecutive_losses
             if risk is None or risk.max_consecutive_losses is None else risk.max_consecutive_losses,
-            max_position_loss_pct=one_stop
+            max_position_loss_pct=0.0 if trading.exit_mode == "liquidation" else one_stop
             if risk is None or risk.max_position_loss_pct is None else risk.max_position_loss_pct,
+            liquidation_buffer_pct=trading.liquidation_buffer_pct
+            if trading.exit_mode == "liquidation" else 0.0,
         )
 
 
@@ -184,6 +187,8 @@ class RiskGuard:
             try:
                 live = self.broker.get_position(symbol)
             except BrokerError as exc:
+                if self.limits.liquidation_buffer_pct > 0:
+                    raise
                 # 读不到就跳过这一个，别把它当成"交易所说没有"。
                 log.warning("%s: 读不到交易所仓位，本轮跳过该仓的风控检查（%s）", symbol, exc)
                 continue
@@ -196,6 +201,19 @@ class RiskGuard:
                         close_symbols=tuple(s for s in booked.close_symbols if s != symbol))
                 continue
 
+            if self.limits.liquidation_buffer_pct > 0:
+                from .liquidation import distance_pct
+                info = live.get("info") or {}
+                mark = float(live.get("markPrice") or info.get("markPx") or 0)
+                liq = float(live.get("liquidationPrice") or info.get("liqPx") or 0)
+                try:
+                    distance = distance_pct(position.side, mark, liq)
+                except ValueError as exc:
+                    raise BrokerError(f"{symbol}: 强平价或标记价不可用，暂停新增风险") from exc
+                if distance <= self.limits.liquidation_buffer_pct:
+                    condemned.append(symbol)
+                    log.error("%s: 距强平价 %.2f%% <= 缓冲 %.2f%%", symbol, distance,
+                              self.limits.liquidation_buffer_pct)
             unrealized = float(live.get("unrealizedPnl") or 0.0)
             loss_pct = -unrealized / equity * 100.0 if equity > 0 else 0.0
             if self.limits.max_position_loss_pct > 0 and loss_pct >= self.limits.max_position_loss_pct:
@@ -206,7 +224,8 @@ class RiskGuard:
         if condemned:
             # 只平点名的那几笔；但既然是"止损失效"级别的事件，同时停手——
             # 让人看一眼比让它继续按同一套逻辑下单重要。
-            return self._halt(f"单仓浮亏超限：{','.join(condemned)}",
+            reason = "接近强平价" if self.limits.liquidation_buffer_pct > 0 else "单仓浮亏超限"
+            return self._halt(f"{reason}：{','.join(condemned)}",
                               flatten=False, close_symbols=tuple(condemned))
 
         return RiskDecision()

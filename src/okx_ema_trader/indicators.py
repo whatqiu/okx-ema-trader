@@ -31,6 +31,7 @@ def indicator_frame(candles: list[list[float]], ema_fast: int, ema_slow: int, ad
     frame["ema_fast"] = close.ewm(span=ema_fast, adjust=False).mean()
     frame["ema_slow"] = close.ewm(span=ema_slow, adjust=False).mean()
     _attach_adx(frame, adx_period)
+    frame.attrs['warmup_until_ts'] = int(frame['ts'].iloc[max(ema_slow, adx_period * 2) - 1])
     return frame
 
 

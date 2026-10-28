@@ -77,7 +77,8 @@ def test_paper_price_stop_uses_configured_distance(store, side, mark):
 
 def make_executor(tmp_path, broker, symbols=(SYMBOL,)):
     cfg = load_config(ROOT / "config" / "config.yaml")
-    cfg = replace(cfg, trading=replace(cfg.trading, symbols=symbols))
+    cfg = replace(cfg, trading=replace(cfg.trading, symbols=symbols,
+                                      exit_mode="fixed", stop_loss_pct=2.0))
     ledger = Ledger(path=tmp_path / "state.yaml")
     return Executor(cfg, broker, ledger)
 

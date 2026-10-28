@@ -425,7 +425,7 @@ def test_enforce_risk_reports_loudly_when_close_fails():
         paper.open_position(store, INST, "long", notional=1000.0, leverage=10.0,
                             price=100.0)
 
-        def boom(store_, order_id, price):
+        def boom(store_, order_id, price, **kwargs):
             raise RuntimeError("模拟盘接口超时")
 
         paper.close_position = boom

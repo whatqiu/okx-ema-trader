@@ -257,8 +257,10 @@ class Broker:
         ccxt_side = "buy" if side == "long" else "sell"
         # Stop sits below entry for a long, above for a short; take profit the
         # other way round. Both are distances from the entry price.
-        stop_price = price * (1 - stop_pct / 100) if side == "long" else price * (1 + stop_pct / 100)
-        stop_price = self.exchange.price_to_precision(to_ccxt_symbol(symbol), stop_price)
+        stop_price = 0.0
+        if stop_pct > 0:
+            stop_price = price * (1 - stop_pct / 100) if side == "long" else price * (1 + stop_pct / 100)
+            stop_price = self.exchange.price_to_precision(to_ccxt_symbol(symbol), stop_price)
 
         tp_price = 0.0
         if take_profit_pct > 0:
@@ -269,8 +271,9 @@ class Broker:
         params: dict = {
             "tdMode": "cross",
             "posSide": "net",
-            "stopLoss": {"triggerPrice": stop_price, "type": "market"},
         }
+        if stop_pct > 0:
+            params["stopLoss"] = {"triggerPrice": stop_price, "type": "market"}
         if tp_price:
             # ccxt folds both into one attachAlgoOrd, so this is still a single
             # conditional order carrying slTriggerPx + tpTriggerPx. `_find_stop_id`
@@ -296,8 +299,8 @@ class Broker:
 
         fill_price = float(order.get("average") or order.get("price") or price)
         filled = float(order.get("filled") or size)
-        stop_id = self._find_stop_id(symbol, order.get("id"))
-        if not stop_id:
+        stop_id = self._find_stop_id(symbol, order.get("id")) if stop_pct > 0 else ""
+        if stop_pct > 0 and not stop_id:
             # No stop means no protection. Undo the entry rather than keep it.
             log.error("stop did not attach to %s order %s — closing to avoid a naked position",
                       symbol, order.get("id"))
@@ -457,6 +460,23 @@ class Broker:
         log.info("closed %s (%s %s contracts)", symbol, close_side, contracts)
         return True
 
+    def cancel_fixed_stop(self, symbol: str, stop_id: str) -> None:
+        """Remove only the protection recorded in our ledger during migration."""
+        if self.dry_run:
+            return
+        market = to_ccxt_symbol(symbol)
+        try:
+            def pending():
+                return self.exchange.fetch_open_orders(market, params={"ordType": "conditional"})
+            if any(str(o.get("id")) == stop_id for o in pending()):
+                self.exchange.cancel_order(stop_id, market, params={"trigger": True})
+            if any(str(o.get("id")) == stop_id for o in pending()):
+                raise BrokerError(f"{symbol}: 旧固定止损尚未撤销，暂停启动")
+        except BrokerError:
+            raise
+        except Exception as exc:
+            raise BrokerError(f"{symbol}: 无法确认旧固定止损已撤销：{exc}") from exc
+
     def cancel_stops(self, symbol: str) -> None:
         """Best-effort cancel of leftover conditional orders for a symbol."""
         if self.dry_run:
@@ -470,6 +490,7 @@ class Broker:
             return
         for algo in algos:
             try:
-                self.exchange.cancel_order(str(algo.get("id")), to_ccxt_symbol(symbol))
+                self.exchange.cancel_order(str(algo.get("id")), to_ccxt_symbol(symbol),
+                                           params={"trigger": True})
             except Exception as exc:
                 log.warning("could not cancel algo %s: %s", algo.get("id"), exc)

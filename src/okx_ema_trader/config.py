@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
+import math
 import yaml
 
 
@@ -20,6 +21,8 @@ class TradingConfig:
     risk_per_trade_pct: float = 1.0
     leverage: int = 1
     stop_loss_pct: float = 3.0
+    exit_mode: str = "fixed"  # fixed | liquidation
+    liquidation_buffer_pct: float = 3.0
     # 0 = 只挂止损，不挂止盈。止盈是"到价就走、然后观望"，不是反手。
     take_profit_pct: float = 0.0
     max_total_notional: float = 300.0
@@ -47,6 +50,19 @@ class RiskConfig:
 
 
 @dataclass(frozen=True)
+class PaperStrategyConfig:
+    """Web simulator overrides; never changes exchange executor settings."""
+    entry_mode: str = 'inherit'
+    exit_on_trend_reversal: bool = False
+    reentry_cooldown_bars: int = 0
+    one_entry_per_trend: bool = False
+    liquidation_buffer_pct: float | None = None
+    max_entries_per_trend: int = 0
+    profit_trail_activation_pct: float = 0.0
+    profit_trail_distance_pct: float = 0.0
+
+
+@dataclass(frozen=True)
 class Config:
     symbol: str
     bar_5m: str
@@ -69,6 +85,7 @@ class Config:
     log_level: str
     trading: TradingConfig = field(default_factory=TradingConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    paper_strategy: PaperStrategyConfig = field(default_factory=PaperStrategyConfig)
 
 
 def _optional(raw: dict, key: str, cast) -> object:
@@ -102,7 +119,41 @@ def account_risk_per_trade_pct(trading: TradingConfig) -> float:
     if trading.sizing_mode == "risk":
         return trading.risk_per_trade_pct
     share = (trading.equity_pct / 100.0) if trading.sizing_mode == "equity" else 1.0
-    return trading.stop_loss_pct * trading.leverage * share
+    return sizing_exit_distance_pct(trading) * trading.leverage * share
+
+
+def sizing_exit_distance_pct(trading: TradingConfig) -> float:
+    if trading.exit_mode == "liquidation":
+        from .liquidation import estimated_exit_distance_pct
+        return estimated_exit_distance_pct(trading.leverage, trading.liquidation_buffer_pct)
+    return trading.stop_loss_pct
+
+
+def fixed_stop_pct(trading: TradingConfig) -> float:
+    return trading.stop_loss_pct if trading.exit_mode == "fixed" else 0.0
+
+
+def paper_strategy_for(config: Config, store=None) -> PaperStrategyConfig:
+    selected = store.get_meta('paper_strategy_profile', '') if store is not None else ''
+    if selected == 'trend-v1':
+        return PaperStrategyConfig(entry_mode='trend', exit_on_trend_reversal=True,
+                                   reentry_cooldown_bars=6, one_entry_per_trend=True,
+                                   liquidation_buffer_pct=2.0)
+    if selected == 'wave-v1':
+        return PaperStrategyConfig(entry_mode='wave', exit_on_trend_reversal=True,
+                                   reentry_cooldown_bars=6, liquidation_buffer_pct=2.0,
+                                   max_entries_per_trend=2, profit_trail_activation_pct=1.5,
+                                   profit_trail_distance_pct=1.0)
+    if selected == 'legacy':
+        return PaperStrategyConfig()
+    if selected:
+        raise ValueError(f'unknown paper strategy profile: {selected}')
+    return config.paper_strategy
+
+
+def paper_liquidation_buffer(config: Config, store=None) -> float:
+    override = paper_strategy_for(config, store).liquidation_buffer_pct
+    return config.trading.liquidation_buffer_pct if override is None else override
 
 
 def load_config(path: str | Path) -> Config:
@@ -133,6 +184,8 @@ def load_config(path: str | Path) -> Config:
         risk_per_trade_pct=float(trading.get("risk_per_trade_pct", 1.0)),
         leverage=int(trading.get("leverage", 1)),
         stop_loss_pct=float(trading.get("stop_loss_pct", 3.0)),
+        exit_mode=str(trading.get("exit_mode", "fixed")),
+        liquidation_buffer_pct=float(trading.get("liquidation_buffer_pct", 3.0)),
         take_profit_pct=float(trading.get("take_profit_pct", 0.0)),
         max_total_notional=float(trading.get("max_total_notional", 300.0)),
         position_mode=str(trading.get("position_mode", "cross")),
@@ -145,6 +198,17 @@ def load_config(path: str | Path) -> Config:
         max_position_loss_pct=_optional(risk_raw, "max_position_loss_pct", float),
     )
 
+    paper_raw = raw.get('paper_strategy') or {}
+    paper_config = PaperStrategyConfig(
+        entry_mode=str(paper_raw.get('entry_mode', 'inherit')),
+        exit_on_trend_reversal=bool(paper_raw.get('exit_on_trend_reversal', False)),
+        reentry_cooldown_bars=int(paper_raw.get('reentry_cooldown_bars', 0)),
+        one_entry_per_trend=bool(paper_raw.get('one_entry_per_trend', False)),
+        liquidation_buffer_pct=_optional(paper_raw, 'liquidation_buffer_pct', float),
+        max_entries_per_trend=int(paper_raw.get('max_entries_per_trend', 0)),
+        profit_trail_activation_pct=float(paper_raw.get('profit_trail_activation_pct', 0)),
+        profit_trail_distance_pct=float(paper_raw.get('profit_trail_distance_pct', 0)),
+    )
     config = Config(
         symbol=raw["symbol"], bar_5m=raw["bar_5m"], bar_15m=raw["bar_15m"],
         candle_limit=int(raw["candle_limit"]), ema_fast=int(strategy["ema_fast"]),
@@ -155,6 +219,7 @@ def load_config(path: str | Path) -> Config:
         pullback_tolerance=float(strategy.get("pullback_tolerance", 0.002)),
         reconnect_seconds=int(runtime["reconnect_seconds"]),
         log_level=runtime["log_level"], trading=trading_config, risk=risk_config,
+        paper_strategy=paper_config,
     )
     validate(config)
     return config
@@ -162,6 +227,20 @@ def load_config(path: str | Path) -> Config:
 
 def validate(config: Config) -> None:
     """Reject settings that would silently produce no signal or an endless restart loop."""
+    paper = config.paper_strategy
+    if paper.entry_mode not in ('inherit', 'trend', 'wave'):
+        raise ValueError('paper_strategy.entry_mode must be inherit, trend or wave')
+    if not 0 <= paper.max_entries_per_trend <= 5:
+        raise ValueError('paper_strategy.max_entries_per_trend must be in [0, 5]')
+    a, d = paper.profit_trail_activation_pct, paper.profit_trail_distance_pct
+    if not (math.isfinite(a) and math.isfinite(d)) or not (a == d == 0 or 0 < d < a < 100):
+        raise ValueError('profit trailing requires 0 < distance < activation < 100, or both zero')
+    if not 0 <= paper.reentry_cooldown_bars <= 288:
+        raise ValueError('paper_strategy.reentry_cooldown_bars must be in [0, 288]')
+    if paper.liquidation_buffer_pct is not None and (
+            not math.isfinite(paper.liquidation_buffer_pct)
+            or not 0 < paper.liquidation_buffer_pct < 100):
+        raise ValueError('paper_strategy.liquidation_buffer_pct must be finite and in (0, 100)')
     if config.ema_fast < 1 or config.ema_slow < 1:
         raise ValueError("ema_fast and ema_slow must be >= 1")
     if config.ema_fast >= config.ema_slow:
@@ -202,8 +281,18 @@ def validate(config: Config) -> None:
             f"risk_per_trade_pct must be in (0, 100], got {trading.risk_per_trade_pct}")
     if not 1 <= trading.leverage <= 125:
         raise ValueError(f"leverage must be between 1 and 125, got {trading.leverage}")
-    if not 0 < trading.stop_loss_pct < 100:
+    if trading.exit_mode not in ("fixed", "liquidation"):
+        raise ValueError("exit_mode must be fixed or liquidation")
+    if not 0 < trading.liquidation_buffer_pct < 100:
+        raise ValueError("liquidation_buffer_pct must be in (0, 100)")
+    if trading.exit_mode == "fixed" and not 0 < trading.stop_loss_pct < 100:
         raise ValueError(f"stop_loss_pct must be in (0, 100), got {trading.stop_loss_pct}")
+    if trading.exit_mode == "liquidation":
+        from .liquidation import distance_pct, estimated_liquidation
+        if trading.leverage > 1 and any(
+                distance_pct(side, 1, estimated_liquidation(1, side, trading.leverage))
+                <= trading.liquidation_buffer_pct for side in ("long", "short")):
+            raise ValueError("liquidation buffer already reached at entry; reduce leverage")
     if not 0 <= trading.take_profit_pct < 100:
         raise ValueError(
             f"take_profit_pct must be in [0, 100) (0 = 不挂止盈), got {trading.take_profit_pct}")
@@ -219,7 +308,7 @@ def validate(config: Config) -> None:
     # 50x 强平距离约 2%，挂 2% 止损就是"止损和强平赛跑"，插针就输。
     # 这不是保守偏好，是订单簿上的先后顺序。
     liq = liquidation_distance_pct(trading.leverage)
-    if trading.stop_loss_pct >= liq:
+    if trading.exit_mode == "fixed" and trading.stop_loss_pct >= liq:
         raise ValueError(
             f"stop_loss_pct ({trading.stop_loss_pct}) must be below the liquidation "
             f"distance at {trading.leverage}x (~{liq:.2f}%). "

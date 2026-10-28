@@ -143,6 +143,72 @@ def evaluate_env(ind_5m: dict, ind_15m: dict, adx_min: float,
     return signal
 
 
+def classify_trend(ind_5m: dict, ind_15m: dict, adx_min: float,
+                   deviation_max: float = 1.0) -> tuple[Signal | None, str]:
+    """A continuing trend remains eligible after an entry filter recovers.
+
+    This is a desired position, not permission to pyramid. Callers must keep
+    same-side entries idempotent and apply a cooldown after losing exits.
+    """
+    allowed, why = classify_env(ind_5m, ind_15m, adx_min, deviation_max)
+    if allowed is None:
+        return None, why
+    fast, slow, close = (ind_5m[k] for k in ('ema_fast', 'ema_slow', 'close'))
+    if allowed.side == 'long' and fast > slow and close >= fast:
+        return Signal('long', '15m bullish + 5m trend continues'), 'long'
+    if allowed.side == 'short' and fast < slow and close <= fast:
+        return Signal('short', '15m bearish + 5m trend continues'), 'short'
+    return None, '5m_not_aligned'
+
+
+def evaluate_trend(ind_5m: dict, ind_15m: dict, adx_min: float,
+                   deviation_max: float = 1.0) -> Signal | None:
+    return classify_trend(ind_5m, ind_15m, adx_min, deviation_max)[0]
+
+
+def evaluate_wave(ind_5m: dict, ind_15m: dict, adx_min: float,
+                  deviation_max: float = 1.0) -> Signal | None:
+    """A subsequent entry needs a pullback AND a close back with the trend."""
+    allowed = evaluate_trend(ind_5m, ind_15m, adx_min, deviation_max)
+    if allowed is None:
+        return None
+    fast = ind_5m['ema_fast']
+    if allowed.side == 'long' and ind_5m.get('low', ind_5m['close']) <= fast * 1.002:
+        return Signal('long', '15m bullish + 5m pullback recovered')
+    if allowed.side == 'short' and ind_5m.get('high', ind_5m['close']) >= fast * .998:
+        return Signal('short', '15m bearish + 5m rebound rejected')
+    return None
+
+
+def profit_trailing_exit(side: str, entry: float, peak: float, close: float,
+                         activation_pct: float, distance_pct: float) -> tuple[float, bool]:
+    """Track favorable CLOSED prices; never assume an intrabar high/low order."""
+    if side == 'long':
+        peak = max(entry, peak, close)
+        activated = peak >= entry * (1 + activation_pct / 100)
+        return peak, activated and close <= peak * (1 - distance_pct / 100)
+    peak = min(entry, peak, close)
+    activated = peak <= entry * (1 - activation_pct / 100)
+    return peak, activated and close >= peak * (1 + distance_pct / 100)
+
+
+def trend_reversed(side: str, ind_5m: dict, ind_15m: dict) -> bool:
+    """Close a stale position when BOTH closed timeframes oppose it.
+
+    Entry strength and deviation gates do not veto a risk-reducing exit.
+    A single 5m cross against a still-aligned 15m trend is only a pullback.
+    """
+    if not ind_5m or not ind_15m:
+        return False
+    if side == 'long':
+        return (ind_15m['ema_fast'] < ind_15m['ema_slow']
+                and ind_5m['ema_fast'] < ind_5m['ema_slow'])
+    if side == 'short':
+        return (ind_15m['ema_fast'] > ind_15m['ema_slow']
+                and ind_5m['ema_fast'] > ind_5m['ema_slow'])
+    return False
+
+
 @dataclass
 class PullbackEntry:
     """Enter on a dip INTO the fast EMA instead of on a crossover.

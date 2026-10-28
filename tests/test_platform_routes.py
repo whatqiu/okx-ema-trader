@@ -18,6 +18,7 @@ from __future__ import annotations
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -66,6 +67,26 @@ def status_of(fn, *args, **kwargs) -> int | None:
     except HTTPException as exc:
         return exc.status_code
     return None
+
+
+def test_close_preserves_marks_and_survives_other_ticker_failure():
+    for unavailable in (False, True):
+        with _TempStore() as store:
+            app.paper.open_position(store, GOOD, "long", 1000, 10, 100)
+            order = app.paper.open_position(store, "BTC-USDT-SWAP", "long", 500, 5, 50)
+
+            def ticker(_store, inst):
+                if inst == GOOD and unavailable:
+                    raise RuntimeError("ticker unavailable")
+                return {"last": 80 if inst == GOOD else 55}
+
+            with patch.object(app.market, "fetch_ticker", return_value={"bid": 55, "ask": 56}), \
+                    patch.object(app, "_risk_ticker", side_effect=ticker):
+                app.trade_close(app.TradeCloseRequest(order_id=order["order_id"]))
+            check(len(store.open_orders()) == 1, "unrelated ticker blocked close")
+            expected = 10048.975 if unavailable else 9848.975
+            check(abs(store.equity_series()[-1]["equity"] - expected) < 1e-8,
+                  "close snapshot lost the remaining position valuation")
 
 
 def test_backtests_bad_symbol_is_400_not_500():

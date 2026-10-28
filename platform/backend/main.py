@@ -17,7 +17,9 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -30,12 +32,13 @@ import paper
 import autotrader
 import health
 import notifications
+import rankings
 from okx_ema_trader.backtest import MINUTES_PER_BAR, simulate
 from okx_ema_trader.jsonio import json_safe as _json_safe
 from okx_ema_trader.symbols import SymbolError
 from okx_ema_trader.http import OkxError
 from okx_ema_trader.indicators import indicator_frame
-from okx_ema_trader.config import fixed_stop_pct
+from okx_ema_trader.config import fixed_stop_pct, paper_liquidation_buffer, paper_strategy_for
 
 _poller: market.MarketPoller | None = None
 _auto_stop = threading.Event()
@@ -84,7 +87,8 @@ RISK_LIMITS = health.RiskLimits(
     # 60% of the position's own margin. At 5x that is a ~12% adverse move, well
     # before the 20% liq distance; a tighter cap would turn ordinary noise into
     # forced exits, which is how a strategy loses money on its own brake.
-    max_loss_pct=60.0,
+    max_loss_pct=0.0 if deps.config().trading.exit_mode == "liquidation" else 60.0,
+    price_stop_enabled=deps.config().trading.exit_mode == "fixed",
     # 25% of the account, measured from the equity the brake was installed at
     # (see `health.risk_baseline`) — NOT "per day", despite what this used to be
     # called. Deliberately not the 60% in config.yaml's `risk:` section: that
@@ -98,7 +102,7 @@ RISK_LIMITS = health.RiskLimits(
     max_consecutive_losses=5,
     # Exit when the mark is within 3% of the liq price. At 5x that is well
     # outside the 20% liq distance, so this is a brake, not a coin flip.
-    liq_buffer_pct=3.0,
+    liq_buffer_pct=deps.config().trading.liquidation_buffer_pct,
 )
 
 
@@ -122,6 +126,13 @@ def _janitor_loop() -> None:
         _prune_safe()
 
 
+def _paper_risk_limits(store=None):
+    cfg = deps.config()
+    if paper_strategy_for(cfg, store).liquidation_buffer_pct is None:
+        return RISK_LIMITS
+    return replace(RISK_LIMITS, liq_buffer_pct=paper_liquidation_buffer(cfg, store))
+
+
 def _run_risk_check(store) -> dict:
     """Enforce the circuit breaker. Runs on EVERY auto-loop pass.
 
@@ -136,7 +147,7 @@ def _run_risk_check(store) -> dict:
     global _last_risk
     # Always acquire the account lock first: scans call back here while holding it.
     with store.trade_lock, _risk_lock:
-        report = health.enforce_risk(store, limits=RISK_LIMITS,
+        report = health.enforce_risk(store, limits=_paper_risk_limits(store),
                                      marks=_marks(store),
                                      exit_prices=_exit_prices(store))
         _last_risk = report
@@ -312,6 +323,7 @@ async def lifespan(app: FastAPI):
     _janitor_stop.set()
     _poller.stop()
     market.stop_warmer()
+    rankings.history.stop.set()
 
 
 app = FastAPI(title="okx-ema-trader platform", lifespan=lifespan)
@@ -478,6 +490,18 @@ def ticker(symbol: str = Query(...)):
     return _json_safe(tick)
 
 
+@app.get("/api/market/rankings")
+def market_rankings():
+    rows = _okx(lambda: market.swap_tickers(), label="热门币种")
+    hot = sorted((r for r in rows if rankings.number(r.get("vol_ccy24h")) is not None
+                  and r["vol_ccy24h"] > 0), key=lambda r: -r["vol_ccy24h"])[:20]
+    return _json_safe({"source": "OKX", "timezone": "UTC+8", "total": len(rows),
+                       "today_date": rankings.day_key(), "hot": hot,
+                       "rolling": rankings.leaders(rows, "change24h"),
+                       "today": rankings.leaders(rows, "change_today"),
+                       "history": rankings.history.snapshot(deps.store(), rows)})
+
+
 @app.get("/api/instruments")
 def instruments(q: str = "", limit: int = Query(30, ge=1, le=100)):
     """Symbol search. Empty q = top USDT swaps by 24h volume (quick picks).
@@ -549,6 +573,7 @@ def admin_prune():
 # Auto-trading — the live strategy driving the paper account
 # --------------------------------------------------------------------------
 class AutoTradePatch(BaseModel):
+    strategy_profile: Literal['legacy', 'trend-v1', 'wave-v1'] | None = None
     enabled: bool | None = None
     symbol: str | None = None
     # The watch list. A single `symbol` is still accepted and replaces it, so an
@@ -688,8 +713,9 @@ def health_status():
                 "max_loss_pct": RISK_LIMITS.max_loss_pct,
                 "max_drawdown_pct": RISK_LIMITS.max_drawdown_pct,
                 "max_consecutive_losses": RISK_LIMITS.max_consecutive_losses,
-                "liq_buffer_pct": RISK_LIMITS.liq_buffer_pct,
-                "stop_loss_pct": deps.config().trading.stop_loss_pct,
+                "liq_buffer_pct": _paper_risk_limits(store).liq_buffer_pct,
+                "stop_loss_pct": fixed_stop_pct(deps.config().trading),
+                "exit_mode": deps.config().trading.exit_mode,
             },
             "last": _last_risk,
             # The streak the brake actually judges (counted from the last manual
@@ -762,7 +788,9 @@ def trade_open(req: TradeOpenRequest):
     try:
         result = paper.open_position(store, inst, side, req.notional,
                                      req.leverage, price,
-                                     stop_loss_pct=deps.config().trading.stop_loss_pct,
+                                     stop_loss_pct=fixed_stop_pct(deps.config().trading),
+                                     liquidation_buffer_pct=paper_liquidation_buffer(deps.config(), store)
+                                     if deps.config().trading.exit_mode == "liquidation" else 0,
                                      marks=_marks(store))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -786,8 +814,18 @@ def trade_close(req: TradeCloseRequest):
     price = tick["bid"] if order["side"] == "long" else tick["ask"]
     if not price:
         raise HTTPException(502, "没有可用的平仓价格")
+    # Valuing other positions must not prevent closing a priced position.
+    marks = {}
+    for position in store.open_orders():
+        inst = position["inst_id"]
+        if inst in marks:
+            continue
+        try:
+            marks[inst] = _risk_ticker(store, inst)["last"]
+        except Exception:
+            marks[inst] = position["entry_price"]
     try:
-        result = paper.close_position(store, req.order_id, price)
+        result = paper.close_position(store, req.order_id, price, marks=marks)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return _json_safe(result)
@@ -848,9 +886,21 @@ def run_backtest(req: BacktestRequest):
                                config.adx_period)
     frame_15m = indicator_frame(rows_15m, config.ema_fast, config.ema_slow,
                                 config.adx_period)
+    profile = paper_strategy_for(config, store)
     report = simulate(frame_5m, frame_15m, config.adx_min, config.deviation_max,
                       req.fee_bps + req.slippage_bps, step_5m * 60_000,
-                      config.trading.stop_loss_pct)
+                      config.trading.stop_loss_pct,
+                      liquidation_buffer_pct=paper_liquidation_buffer(config, store)
+                      if config.trading.exit_mode == "liquidation" else 0,
+                      leverage=autotrader.get_state(store)['leverage'],
+                      entry_mode=profile.entry_mode if profile.entry_mode in ('trend','wave') else config.entry_mode,
+                      pullback_tolerance=config.pullback_tolerance,
+                      exit_on_trend_reversal=profile.exit_on_trend_reversal,
+                      reentry_cooldown_bars=profile.reentry_cooldown_bars,
+                      one_entry_per_trend=profile.one_entry_per_trend,
+                      max_entries_per_trend=profile.max_entries_per_trend,
+                      profit_trail_activation_pct=profile.profit_trail_activation_pct,
+                      profit_trail_distance_pct=profile.profit_trail_distance_pct)
 
     trading = config.trading
     exposure = (trading.equity_pct / 100.0 * trading.leverage

@@ -136,7 +136,7 @@ class _Pinned:
 
 def _new_executor(broker: FakeBroker, ledger: Ledger, *, take_profit_pct: float | None = None):
     config = load_config(CONFIG)
-    overrides = {"symbols": (SYMBOL,)}
+    overrides = {"symbols": (SYMBOL,), "exit_mode": "fixed", "stop_loss_pct": 2.0}
     if take_profit_pct is not None:
         # 测试自己指定被测参数，不读config.yaml 的默认值：默认止盈是 0
         # （趋势策略不主动止盈），拿默认值来断言"止盈被传给broker"是错的依赖。

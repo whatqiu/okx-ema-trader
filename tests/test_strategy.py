@@ -242,13 +242,18 @@ def _decide_at(f5, f15, i: int):
     j = int(np.searchsorted(ts_15m, cutoff, side="right")) - 1
     if j < 1:
         return None
+    if (f5['ts'].iloc[i] < f5.attrs.get('warmup_until_ts', float('-inf'))
+            or f15['ts'].iloc[j] < f15.attrs.get('warmup_until_ts', float('-inf'))):
+        return None
     row, prev, r15 = f5.iloc[i], f5.iloc[i - 1], f15.iloc[j]
     return evaluate_signal(
         {"close": float(row["close"]), "ema_fast": float(row["ema_fast"]),
          "ema_slow": float(row["ema_slow"]), "prev_ema_fast": float(prev["ema_fast"]),
          "prev_ema_slow": float(prev["ema_slow"])},
         {"close": float(r15["close"]), "ema_fast": float(r15["ema_fast"]),
-         "ema_slow": float(r15["ema_slow"]), "adx": float(r15["adx"])},
+         "ema_slow": float(r15["ema_slow"]), "adx": float(r15["adx"]),
+         "prev_ema_fast": float(f15.iloc[j-1]['ema_fast']),
+         "prev_ema_slow": float(f15.iloc[j-1]['ema_slow'])},
         ADX_MIN, DEV_MAX,
     )
 

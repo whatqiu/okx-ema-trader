@@ -142,6 +142,7 @@ def _config(**risk: object):
         base["risk"] = risk
     else:
         base.pop("risk", None)
+    base["trading"].update(exit_mode="fixed", stop_loss_pct=2.0)
     path = Path(tempfile.mkdtemp()) / "config.yaml"
     path.write_text(yaml.safe_dump(base), encoding="utf-8")
     return load_config(path)

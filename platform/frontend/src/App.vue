@@ -4,11 +4,14 @@ import { api } from './api'
 import KlineChart from './components/KlineChart.vue'
 import SymbolPicker from './components/SymbolPicker.vue'
 import SymbolShortcuts from './components/SymbolShortcuts.vue'
+import MarketRankings from './components/MarketRankings.vue'
 import { rememberSymbol } from './symbolLists'
 import EquityCurve from './components/v2/EquityCurve.vue'
 import PositionCard from './components/v2/PositionCard.vue'
 import SignalFeed from './components/v2/SignalFeed.vue'
 import TradeTicket from './components/v2/TradeTicket.vue'
+import ResizablePanel from './components/v2/ResizablePanel.vue'
+import ResizeGrip from './components/v2/ResizeGrip.vue'
 
 import './design/tokens.css'
 import './design/components.css'
@@ -20,6 +23,56 @@ const BAR_MS = {
   '30m': 1800000, '1H': 3600000, '4H': 14400000, '1D': 86400000,
 }
 const CHART_HISTORY_DAYS = 30
+
+const layoutElement = ref(null)
+const leftColumn = ref(null)
+const rightColumn = ref(null)
+const layoutWidth = ref(window.innerWidth - 16)
+const columnSizes = ref({ left: 300, right: 380 })
+function readColumnWidth(side) {
+  try {
+    const value = Number(localStorage.getItem(`layout-width:${side}`))
+    return Number.isFinite(value) && value >= 220 ? Math.min(value, 640) : null
+  } catch { return null }
+}
+const leftWidth = ref(readColumnWidth('left'))
+const rightWidth = ref(readColumnWidth('right'))
+const columnMax = side => Math.max(220, Math.min(640,
+  layoutWidth.value - columnSizes.value[side === 'left' ? 'right' : 'left'] - 280))
+const layoutStyle = computed(() => {
+  const width = layoutWidth.value
+  const left = leftWidth.value ?? (width <= 1180 ? 244 : width <= 1440 ? 272 : 300)
+  const right = rightWidth.value ?? (width <= 1180 ? 320 : width <= 1440 ? 344 : 380)
+  // Keep space for the chart when a saved layout is opened on a smaller screen.
+  const scale = Math.max(0, Math.min(1, (width - 280 - 440) / (left + right - 440 || 1)))
+  return {
+    '--left-width': `${220 + (left - 220) * scale}px`,
+    '--right-width': `${220 + (right - 220) * scale}px`,
+  }
+})
+function resizeColumn(side, value) {
+  const width = value == null ? null : Math.max(220, Math.min(columnMax(side), value))
+  const target = side === 'left' ? leftWidth : rightWidth
+  target.value = width
+  try {
+    if (width == null) localStorage.removeItem(`layout-width:${side}`)
+    else localStorage.setItem(`layout-width:${side}`, String(width))
+  } catch { /* Layout remains usable when storage is unavailable. */ }
+}
+let layoutObserver
+onMounted(() => {
+  layoutObserver = new ResizeObserver(entries => {
+    for (const entry of entries) {
+      if (entry.target === layoutElement.value) layoutWidth.value = entry.contentRect.width
+      else if (entry.target === leftColumn.value) columnSizes.value.left = entry.contentRect.width
+      else if (entry.target === rightColumn.value) columnSizes.value.right = entry.contentRect.width
+    }
+  })
+  layoutObserver.observe(layoutElement.value)
+  layoutObserver.observe(leftColumn.value)
+  layoutObserver.observe(rightColumn.value)
+})
+onBeforeUnmount(() => layoutObserver?.disconnect())
 
 /**
  * 浏览器只保留当前周期 30 天的数据；5m 的 8,640 根在传输层受 5,000
@@ -627,7 +680,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
 
         <span v-if="status && riskActive" class="badge"
               :class="losingStreak > 0 ? 'badge--warn' : 'badge--idle'"
-              :title="`价格止损 ${status.risk.limits.stop_loss_pct}%｜账户回撤 ${status.risk.limits.max_drawdown_pct}% 或连亏 ${status.risk.limits.max_consecutive_losses} 次后平仓停手`">
+              :title="`距强平价 ≤ ${status.risk.limits.liq_buffer_pct}% 退出｜账户回撤 ${status.risk.limits.max_drawdown_pct}% 或连亏 ${status.risk.limits.max_consecutive_losses} 次后平仓停手`">
           {{ riskHalted ? '风控熔断' : losingStreak > 0 ? `连亏${losingStreak}` : '风控启用' }}
         </span>
 
@@ -679,10 +732,11 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
     </div>
 
     <!-- ================= 主体 ================= -->
-    <main class="layout">
+    <main ref="layoutElement" class="layout" :style="layoutStyle">
       <!-- ---------- 左栏：账户 + 权益 + 信号 ---------- -->
-      <aside class="layout__left">
-        <section v-if="account" class="panel panel--pad">
+      <aside ref="leftColumn" class="layout__left">
+        <MarketRankings :symbol="symbol" @select="selectShortcut" />
+        <ResizablePanel storage-key="account" label="模拟账户" v-if="account" class="panel panel--pad">
           <h2 class="panel__title">
             模拟账户
             <button class="btn btn--ghost btn--mini"
@@ -724,10 +778,10 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
               </dd>
             </div>
           </dl>
-        </section>
+        </ResizablePanel>
 
         <!-- 24h 行情：横排而非竖排，纵向空间让给权益曲线和信号 -->
-        <section v-if="ticker" class="panel panel--pad">
+        <ResizablePanel storage-key="ticker" label="24 小时行情" v-if="ticker" class="panel panel--pad">
           <h2 class="panel__title">24 小时</h2>
           <div class="ticker-grid">
             <div class="ticker-grid__cell">
@@ -755,9 +809,9 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
               <b class="num">{{ fmtNum(ticker.low24h) }}</b>
             </div>
           </div>
-        </section>
+        </ResizablePanel>
 
-        <section class="panel panel--fill">
+        <ResizablePanel storage-key="signals" label="信号记录" class="panel panel--fill">
           <h2 class="panel__title">
             信号记录
             <span class="panel__count">{{ signalLog.length }}</span>
@@ -765,8 +819,13 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
           <div class="scroll panel__body">
             <SignalFeed :signals="signalLog" />
           </div>
-        </section>
+        </ResizablePanel>
       </aside>
+
+      <ResizeGrip class="layout__divider" axis="x" label="调整左栏宽度" :min="220" :max="columnMax('left')"
+                  :model-value="columnSizes.left"
+                  :measure="() => leftColumn?.clientWidth || 300"
+                  @update:model-value="resizeColumn('left', $event)" @reset="resizeColumn('left', null)" />
 
       <!-- ---------- 中栏：图表 ---------- -->
       <section class="layout__center">
@@ -792,7 +851,12 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
       </section>
 
       <!-- ---------- 右栏：工作台（标签页隔离任务） ---------- -->
-      <aside class="layout__right">
+      <ResizeGrip class="layout__divider" axis="x" label="调整右栏宽度" :direction="-1" :min="220" :max="columnMax('right')"
+                  :model-value="columnSizes.right"
+                  :measure="() => rightColumn?.clientWidth || 380"
+                  @update:model-value="resizeColumn('right', $event)" @reset="resizeColumn('right', null)" />
+
+      <aside ref="rightColumn" class="layout__right">
         <div class="tabs worktabs" role="tablist">
           <button v-for="t in TABS" :key="t.key"
                   class="tabs__btn"
@@ -804,7 +868,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
 
         <!-- ===== 交易 ===== -->
         <template v-if="workTab === 'trade'">
-          <section class="panel panel--pad">
+          <ResizablePanel storage-key="trade" label="交易台" class="panel panel--pad">
             <TradeTicket
               v-model:side="tradeSide"
               v-model:notional="tradeNotional"
@@ -815,9 +879,9 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
               :blocked="riskHalted ? '风控已熔断，暂停开仓' : !connOk ? '连接恢复后可开仓' : !account ? '正在读取账户' : ''"
               @submit="openTrade"
               @set-pct="setNotionalPct" />
-          </section>
+          </ResizablePanel>
 
-          <section class="panel panel--fill">
+          <ResizablePanel storage-key="positions" label="持仓" class="panel panel--fill">
             <h2 class="panel__title">
               持仓
               <span class="panel__count">{{ account?.positions?.length || 0 }}</span>
@@ -827,6 +891,8 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
                 v-for="p in account?.positions || []"
                 :key="p.id"
                 :position="p"
+                :exit-mode="status?.risk?.limits?.exit_mode || 'liquidation'"
+                :buffer-pct="status?.risk?.limits?.liq_buffer_pct || 3"
                 :busy="closingId === p.id"
                 @close="closeTrade" />
               <div v-if="!(account?.positions?.length)" class="empty">
@@ -835,12 +901,12 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
                 <span>用上方交易台手动开仓，或在「自动」标签页启动策略</span>
               </div>
             </div>
-          </section>
+          </ResizablePanel>
         </template>
 
         <!-- ===== 自动 ===== -->
         <template v-else-if="workTab === 'auto'">
-          <section class="panel panel--pad" :class="{ 'panel--live': auto?.enabled }">
+          <ResizablePanel storage-key="auto" label="自动交易" class="panel panel--pad" :class="{ 'panel--live': auto?.enabled }">
             <div class="auto-head">
               <h2 class="panel__title">
                 自动交易
@@ -857,7 +923,16 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
             </div>
 
             <p class="auto-desc">
-              15m 趋势 + ADX&gt;20 + 5m EMA20/50 交叉 · 每根 5m 收盘评估 · 无信号不操作
+              <template v-if="auto?.strategy?.entry_mode === 'wave'">
+                顺势波段 · 每轮趋势最多 {{ auto.strategy.max_entries_per_trend }} 次 · 平仓后等待 30 分钟
+                · 价格顺向 {{ auto.strategy.profit_trail_activation_pct }}% 后，较最佳收盘价回撤 {{ auto.strategy.profit_trail_distance_pct }}% 退出
+              </template>
+              <template v-else-if="auto?.strategy?.entry_mode === 'trend'">
+                持续趋势 · 每根 5m 收盘评估 · 每轮趋势只开一次，不重复加仓 · 双周期反转退出
+              </template>
+              <template v-else>
+                15m 趋势 + ADX&gt;20 + 5m EMA20/50 交叉 · 每根 5m 收盘评估 · 无信号不操作
+              </template>
             </p>
 
             <div class="field">
@@ -907,9 +982,9 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
             <div v-if="auto?.last_error" class="auto-note auto-note--bad">
               最近错误：{{ auto.last_error }}
             </div>
-          </section>
+          </ResizablePanel>
 
-          <section v-if="(auto?.symbols || []).length" class="panel panel--fill">
+          <ResizablePanel storage-key="scan" label="扫描结果" v-if="(auto?.symbols || []).length" class="panel panel--fill">
             <h2 class="panel__title">扫描结果</h2>
             <div class="scroll panel__body">
               <div class="scan">
@@ -925,12 +1000,12 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
                 </div>
               </div>
             </div>
-          </section>
+          </ResizablePanel>
         </template>
 
         <!-- ===== 回测 ===== -->
         <template v-else-if="workTab === 'backtest'">
-          <section class="panel panel--pad">
+          <ResizablePanel storage-key="backtest-params" label="回测参数" class="panel panel--pad">
             <h2 class="panel__title">参数</h2>
             <div class="bt-params">
               <label class="field">
@@ -949,9 +1024,9 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
             <button class="btn btn--primary btn--block btn--lg" :disabled="btRunning" @click="runBacktest">
               {{ btRunning ? '回测中…' : '运行回测' }}
             </button>
-          </section>
+          </ResizablePanel>
 
-          <section v-if="btResult" class="panel panel--pad">
+          <ResizablePanel storage-key="backtest-result" label="回测结果" v-if="btResult" class="panel panel--pad">
             <h2 class="panel__title">
               本次结果
               <span class="tag" :class="btResult.net_return > 0 ? 'tag--up' : 'tag--down'">
@@ -981,9 +1056,9 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
             <p class="verdict" :class="btResult.net_return > 0 ? 'tone-up' : 'tone-down'">
               {{ btResult.verdict }}
             </p>
-          </section>
+          </ResizablePanel>
 
-          <section class="panel panel--fill">
+          <ResizablePanel storage-key="backtests" label="历史回测" class="panel panel--fill">
             <h2 class="panel__title">
               历史回测
               <span class="panel__count">{{ backtests.length }}</span>
@@ -1001,12 +1076,12 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
                 <span>暂无回测记录</span>
               </div>
             </div>
-          </section>
+          </ResizablePanel>
         </template>
 
         <!-- ===== 历史 ===== -->
         <template v-else>
-          <section class="panel panel--fill">
+          <ResizablePanel storage-key="orders" label="订单记录" class="panel panel--fill">
             <h2 class="panel__title">
               订单记录
               <span class="panel__count">{{ historyOrders.length }}</span>
@@ -1059,7 +1134,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
                 <span>暂无符合条件的订单</span>
               </div>
             </div>
-          </section>
+          </ResizablePanel>
         </template>
       </aside>
     </main>

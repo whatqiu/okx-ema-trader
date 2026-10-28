@@ -70,8 +70,8 @@
 .layout {
   flex: 1;
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr) 380px;
-  gap: var(--sp-2);
+  grid-template-columns: var(--left-width, 300px) 8px minmax(0, 1fr) 8px var(--right-width, 380px);
+  gap: 0;
   padding: var(--sp-2);
   min-height: 0;
 }
@@ -83,6 +83,9 @@
   gap: var(--sp-2);
   min-height: 0;
   min-width: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
 
 .layout__center {
@@ -308,12 +311,12 @@
 /* 平板：先收掉中栏图表的独立列宽，让两侧保持可用；
    移动端：改为纵向堆叠，图表置顶，触控目标由 tokens.css 放大到 44px。 */
 @media (max-width: 1440px) {
-  .layout { grid-template-columns: 272px minmax(0, 1fr) 344px; }
+  .layout { grid-template-columns: var(--left-width, 272px) 8px minmax(0, 1fr) 8px var(--right-width, 344px); }
   .quote__last { font-size: var(--fs-2xl); }
 }
 
 @media (max-width: 1180px) {
-  .layout { grid-template-columns: 244px minmax(0, 1fr) 320px; gap: var(--sp-1); padding: var(--sp-1); }
+  .layout { grid-template-columns: var(--left-width, 244px) 8px minmax(0, 1fr) 8px var(--right-width, 320px); padding: var(--sp-1); }
   .auto-params, .bt-params { grid-template-columns: 1fr 1fr; }
 }
 
@@ -325,9 +328,10 @@
     overflow-y: auto;
   }
   .layout__left, .layout__right { min-height: 0; }
+  .layout__divider { display: none; }
   .layout__center { grid-row: 1; }
   .layout__left > .panel, .layout__right > .panel { flex: 0 0 auto; }
-  .layout__left .panel--fill, .layout__right .panel--fill { max-height: 400px; }
+  .layout__left .panel--fill, .layout__right .panel--fill { height: 360px; }
   .chart-card { min-height: 320px; }
   .quote__last { font-size: var(--fs-xl); }
 }

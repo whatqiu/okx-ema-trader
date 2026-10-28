@@ -367,6 +367,7 @@ def fetch_ticker(store, inst_id: str, fetch=None) -> dict:
 # --------------------------------------------------------------------------
 _TICKERS_TTL = 300.0  # seconds
 _tickers_cache: tuple[float, list[dict]] | None = None
+_tickers_cache_day: int | None = None
 
 
 def swap_tickers(fetch=None, force: bool = False) -> list[dict]:
@@ -377,9 +378,10 @@ def swap_tickers(fetch=None, force: bool = False) -> list[dict]:
     keystroke — without a cache, typing "BTC" would mean three full
     downloads of every swap on the exchange inside our 20req/2s budget.
     """
-    global _tickers_cache
+    global _tickers_cache, _tickers_cache_day
     now = time.monotonic()
-    if not force and _tickers_cache and now - _tickers_cache[0] < _TICKERS_TTL:
+    day = int((time.time() + 8 * 3600) // 86400)
+    if not force and _tickers_cache and _tickers_cache_day == day and now - _tickers_cache[0] < _TICKERS_TTL:
         return _tickers_cache[1]
     fetch = fetch or deps.okx_get
     data = fetch("/market/tickers", {"instType": "SWAP"})
@@ -389,6 +391,7 @@ def swap_tickers(fetch=None, force: bool = False) -> list[dict]:
         if not inst.endswith("-USDT-SWAP"):
             continue
         last, open24 = _f(raw.get("last")), _f(raw.get("open24h"))
+        day_open = _f(raw.get("sodUtc8"))
         vol_ccy = _f(raw.get("volCcy24h")) or 0.0
         # volCcy24h is denominated in the COIN, not in USDT. Ranking by it
         # directly lets ultra-cheap tokens (SATS, PEPE — 45 trillion units of
@@ -399,9 +402,12 @@ def swap_tickers(fetch=None, force: bool = False) -> list[dict]:
             "last": last,
             "vol_ccy24h": vol_ccy * last if last else 0.0,
             "change24h": (last - open24) / open24 if last and open24 else None,
+            "change_today": (last - day_open) / day_open if last and day_open else None,
+            "ts": raw.get("ts"),
         })
     rows.sort(key=lambda r: -r["vol_ccy24h"])
     _tickers_cache = (now, rows)
+    _tickers_cache_day = day
     return rows
 
 

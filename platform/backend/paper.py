@@ -48,6 +48,8 @@ def reset_account(store, balance: float = DEFAULT_BALANCE) -> None:
         conn.execute("DELETE FROM orders")
         conn.execute("DELETE FROM equity")
         conn.execute("DELETE FROM meta WHERE key='paper_archived_pnl'")
+        conn.execute("DELETE FROM meta WHERE key LIKE 'auto_trend_regime:%' OR key LIKE 'auto_trend_entered:%'")
+        conn.execute("DELETE FROM meta WHERE key LIKE 'auto_trend_count:%' OR key LIKE 'auto_profit_peak:%'")
         conn.execute("INSERT INTO meta(key,value) VALUES (?,?) "
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                      (_META_KEY, str(float(balance))))
@@ -69,7 +71,8 @@ def _f(value) -> float | None:
 @serialised
 def open_position(store, inst_id: str, side: str, notional: float,
                   leverage: float, price: float, *, stop_loss_pct: float = 0.0,
-                  marks: dict[str, float] | None = None) -> dict:
+                  marks: dict[str, float] | None = None,
+                  liquidation_buffer_pct: float = 0.0) -> dict:
     """Open a paper position at `price` (caller passes real bid/ask).
 
     Raises ValueError on anything that would be rejected by a real exchange's
@@ -86,6 +89,11 @@ def open_position(store, inst_id: str, side: str, notional: float,
         raise ValueError("名义价值必须大于 0")
     if not (1 <= leverage <= 125):
         raise ValueError("杠杆必须在 1–125 之间")
+    if liquidation_buffer_pct > 0:
+        from okx_ema_trader.liquidation import distance_pct, estimated_liquidation
+        liq = estimated_liquidation(price, side, leverage)
+        if liq > 0 and distance_pct(side, price, liq) <= liquidation_buffer_pct:
+            raise ValueError("当前杠杆在开仓时已进入强平缓冲区，请降低杠杆")
 
     if not math.isfinite(stop_loss_pct) or not 0 <= stop_loss_pct < 100:
         raise ValueError("止损百分比必须在 0–100 之间")
@@ -105,13 +113,14 @@ def open_position(store, inst_id: str, side: str, notional: float,
         leverage=leverage, stop_price=stop, status="filled", reason="paper")
     # Equity already reflects the opening fee: position_unrealised deducts it.
     # Subtracting it again here would double-count.
-    store.add_equity(account_summary(store)["equity"], note=f"open {side} {inst_id}")
+    store.add_equity(account_summary(store, marks)["equity"], note=f"open {side} {inst_id}")
     return {"order_id": order_id, "entry_price": price, "notional": notional,
             "leverage": leverage, "margin": margin, "fee": fee}
 
 
 @serialised
-def close_position(store, order_id: int, price: float) -> dict:
+def close_position(store, order_id: int, price: float, *, reason: str = 'paper-close',
+                   marks: dict[str, float] | None = None) -> dict:
     """Close an open paper position at `price`. Returns realised PnL details."""
     if not math.isfinite(price) or price <= 0:
         raise ValueError("成交价格必须大于 0 且为有限数字")
@@ -128,8 +137,8 @@ def close_position(store, order_id: int, price: float) -> dict:
     margin = notional / order["leverage"]
     pnl_pct = pnl / margin if margin else 0.0
 
-    store.close_order(order_id, price, pnl=pnl, pnl_pct=pnl_pct, reason="paper-close")
-    account_after = account_summary(store)
+    store.close_order(order_id, price, pnl=pnl, pnl_pct=pnl_pct, reason=reason)
+    account_after = account_summary(store, marks)
     store.add_equity(account_after["equity"], note=f"close #{order_id}")
     return {"order_id": order_id, "exit_price": price, "gross_return": gross,
             "fees": fees, "pnl": pnl, "pnl_pct": pnl_pct}

@@ -163,6 +163,10 @@ function fmtNum(v, d = 4) {
         <dt>预估强平价 <span class="tone-dim">估算</span></dt>
         <dd class="num tone-down">{{ fmtNum(liqEstimate) }}</dd>
       </div>
+      <div class="breakdown__row">
+        <dt>退出保护</dt>
+        <dd>距强平价 ≤ 3%</dd>
+      </div>
     </dl>
 
     <button class="btn btn--lg btn--block submit"
