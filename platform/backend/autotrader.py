@@ -479,10 +479,19 @@ def maybe_trade(store, inst_id: str, *, signal_fn=None, price_fn=None,
                 health.set_risk_halt(store, "平仓后风控检查失败，请检查行情和账户")
                 raise
         halted = halted or health.risk_halted(store)
-        if not same and not halted:
+        if not same and not halted and len(store.open_orders()) < state['max_positions']:
             entry = prices["ask"] if side == "long" else prices["bid"]
+            from okx_ema_trader.executor import exposure_for
+            from okx_ema_trader.sizing import bounded_exposure
+            equity = paper.account_summary(store)['equity']
+            notional = state['notional']
+            if cfg.trading.sizing_mode == 'risk':
+                notional = min(notional, exposure_for(cfg.trading, equity))
+            notional = bounded_exposure(cfg.trading, equity, notional, side, store.open_orders())
+            if notional <= 0:
+                raise ValueError('组合或同向风险预算已用完，暂停开仓')
             opened = paper.open_position(store, inst_id, side,
-                                         state["notional"], state["leverage"],
+                                         notional, min(state["leverage"], cfg.trading.leverage),
                                          entry, stop_loss_pct=fixed_stop_pct(cfg.trading),
                                          liquidation_buffer_pct=paper_liquidation_buffer(cfg, store)
                                          if cfg.trading.exit_mode == "liquidation" else 0)

@@ -140,6 +140,19 @@ const btResult = ref(null)
 // 结果是用户打开自动交易页看到的是从未生效过的数字，
 // 改一个参数就可能把真实仓位规模改掉 30 倍。
 const auto = ref(null)
+const execution = ref(null)
+const learning = ref(null)
+const executionBusy = ref(false)
+
+async function switchExecution(action) {
+  executionBusy.value = true
+  try {
+    execution.value = await api.switchExecution(action)
+    await loadPanels()
+    flash(action === 'live' ? '已切换实盘，本地自动交易已启动' : action === 'pause' ? '已暂停实盘新开仓，持仓风控继续运行' : '已切回模拟，模拟自动交易需单独启动')
+  } catch (err) { flash(err.message) }
+  finally { executionBusy.value = false }
+}
 const autoNotional = ref(0)
 const autoLeverage = ref(1)
 const autoMaxPositions = ref(1)
@@ -246,8 +259,8 @@ let syncing = ref(false)
 
 const changePct = computed(() => {
   const t = ticker.value
-  if (!t || !t.open24h) return null
-  return (t.last - t.open24h) / t.open24h * 100
+  if (!t || !t.sodUtc0) return null
+  return (t.last - t.sodUtc0) / t.sodUtc0 * 100
 })
 const changeTone = computed(() =>
   changePct.value == null ? '' : changePct.value >= 0 ? 'tone-up' : 'tone-down')
@@ -401,6 +414,8 @@ async function loadPanels() {
     equityRows.value = eq.rows
     account.value = acc
     const at = await api.autotrade()
+    execution.value = await api.execution()
+    learning.value = await api.learning()
     if (version !== viewVersion) return
     auto.value = at
     syncAutoFields(at)
@@ -476,7 +491,7 @@ async function closeTrade(pos) {
   await guard(async () => {
     const res = await api.closeTrade(pos.id)
     flash(`已平仓 #${pos.id} @ ${fmtNum(res.exit_price)} · 盈亏 ${res.pnl >= 0 ? '+' : ''}${res.pnl.toFixed(2)} USDT`)
-    await loadPanels()
+    await Promise.all([loadPanels(), loadOrders()])
   })
   closingId.value = null
 }
@@ -624,6 +639,7 @@ function setupTimers() {
     setInterval(() => loadCandles(false), 5000),
     setInterval(loadTicker, 3000),
     setInterval(loadPanels, 10000),
+    setInterval(() => { if (workTab.value === 'history') loadOrders() }, 10000),
     // 存活性故意不绑在自动刷新开关上。关掉刷新 = "别再向市场要K线"，
     // 但你依然需要知道连接是否断了。
     setInterval(loadStatus, 4000),
@@ -648,7 +664,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
       <div class="brand">
         <span class="brand__mark">OKX</span>
         <span class="brand__text">EMA Trader</span>
-        <span class="tag tag--warn">模拟盘</span>
+        <span class="tag tag--warn">{{ execution?.mode === 'live' ? '实盘 · 真实资金' : '模拟盘' }}</span>
       </div>
 
       <div class="topbar__instrument">
@@ -661,7 +677,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
       <!-- 当前价格：最大字号的信息，视线落点 -->
       <div v-if="ticker" class="quote">
         <span class="quote__last num" :class="changeTone">{{ fmtNum(ticker.last) }}</span>
-        <span class="quote__chg num" :class="changeTone">
+        <span class="quote__chg num" :class="changeTone" title="北京时间 08:00 起算（UTC 零点）">
           {{ changePct == null ? '—' : (changePct >= 0 ? '+' : '') + changePct.toFixed(2) + '%' }}
         </span>
       </div>
@@ -793,8 +809,8 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
               <b class="num tone-down">{{ fmtNum(ticker.ask) }}</b>
             </div>
             <div class="ticker-grid__cell">
-              <span class="ticker-grid__k">24h 开</span>
-              <b class="num">{{ fmtNum(ticker.open24h) }}</b>
+              <span class="ticker-grid__k">北京 08:00 开</span>
+              <b class="num">{{ fmtNum(ticker.sodUtc0) }}</b>
             </div>
             <div class="ticker-grid__cell">
               <span class="ticker-grid__k">24h 额</span>
@@ -830,7 +846,7 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
       <!-- ---------- 中栏：图表 ---------- -->
       <section class="layout__center">
         <div class="chart-card">
-          <KlineChart :rows="rows" :markers="markers" :ema-fast="20" :ema-slow="50" />
+          <KlineChart :rows="rows" :markers="markers" :current-price="ticker?.last" :ema-fast="20" :ema-slow="50" />
         </div>
         <div class="statusline">
           <span class="statusline__item">
@@ -906,7 +922,29 @@ onBeforeUnmount(() => timers.forEach(clearInterval))
 
         <!-- ===== 自动 ===== -->
         <template v-else-if="workTab === 'auto'">
-          <ResizablePanel storage-key="auto" label="自动交易" class="panel panel--pad" :class="{ 'panel--live': auto?.enabled }">
+          <ResizablePanel storage-key="execution" label="交易环境" class="panel panel--pad">
+            <h2 class="panel__title">{{ execution?.mode === 'live' ? '实盘 · 真实资金' : '模拟交易' }}</h2>
+            <p class="auto-desc">实盘策略：{{ execution?.strategy || 'crossover' }} · 版本：{{ execution?.strategy_version || '基础版本' }}。模拟策略先经训练和未来数据验证，达标后自动在空仓时应用；风险预算与账户保持独立。</p>
+            <p class="auto-note">自动学习：{{ learning?.status || '等待后台首次检查（每 10 分钟）' }}</p>
+            <p class="auto-note">规则：过去 14 天选候选，冻结后再观察未来 7 天；至少 30 笔、每标的至少 10 笔、扣成本后各标的盈利、优于基准、收益因子 ≥ 1.2，并通过成本压力测试。</p>
+            <p v-if="learning?.trial" class="auto-note">验证版本 {{ learning.trial.version }} · 验证结束 {{ new Date(learning.trial.end).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) }}</p>
+            <p class="auto-desc">3 倍杠杆上限 · 单笔风险 0.25% · 总风险 0.75% · 同向风险 0.5%。本机需持续运行；重启后暂停新增交易并重新对账。</p>
+            <button class="btn btn--danger" :disabled="executionBusy || !execution || execution.enabled" @click="switchExecution('live')">
+              {{ execution?.mode === 'live' ? '启动实盘自动交易' : '切换实盘并启动（真实下单）' }}
+            </button>
+            <template v-if="execution?.mode === 'live'">
+              <button class="btn" :disabled="executionBusy" @click="switchExecution('pause')">暂停新开仓</button>
+              <button class="btn" :disabled="executionBusy" @click="switchExecution('paper')">切回模拟（须实盘空仓）</button>
+              <p class="auto-note">账户 UID：{{ execution.uid || '未完成对账' }} · {{ execution.enabled ? '允许自动开仓' : '新增交易已暂停' }} · {{ execution.running ? '执行器运行中' : '执行器已停止' }}</p>
+              <p class="auto-note">USDT 权益：{{ execution.equity ?? '尚未读取' }} · 标的：{{ execution.symbols?.join('、') }}</p>
+              <p v-for="position in execution.positions" :key="position.symbol" class="auto-note">
+                {{ position.symbol }} · {{ position.side }} · {{ position.size }} 张 · 入场 {{ position.entry_price }} · 止损 {{ position.stop_price }}
+              </p>
+              <p class="auto-note">实盘持仓以此面板及 OKX 为准；其他账户、订单和历史面板仍展示本地模拟数据。平仓请在 OKX 操作，程序会核对成交后结算。</p>
+            </template>
+            <p v-if="execution?.error" class="auto-note auto-note--bad">{{ execution.error }}</p>
+          </ResizablePanel>
+          <ResizablePanel v-if="execution?.mode !== 'live'" storage-key="auto" label="自动交易" class="panel panel--pad" :class="{ 'panel--live': auto?.enabled }">
             <div class="auto-head">
               <h2 class="panel__title">
                 自动交易

@@ -39,9 +39,10 @@ from .history import fetch_candles
 from .indicators import calculate_indicators
 from .risk_guard import GuardLimits, RiskGuard, realized_pnl
 from .state import Ledger, Position, RiskState, StateError
+from .sizing import bounded_exposure
 from .strategy import (REASON_ADX, REASON_DEVIATION, REASON_NO_CROSS,
                        REASON_NO_ENV, REASON_WARMUP, PullbackEntry, Signal,
-                       classify)
+                       classify, classify_trend, evaluate_wave, profit_trailing_exit, trend_reversed)
 
 ROOT = Path(__file__).parents[2]
 CONFIG_PATH = ROOT / "config" / "config.yaml"
@@ -94,7 +95,7 @@ def exposure_for(trading: TradingConfig, equity: float) -> float:
     """
     if trading.sizing_mode == "risk":
         return equity * (trading.risk_per_trade_pct / 100.0) / (
-            sizing_exit_distance_pct(trading) / 100.0)
+            sizing_exit_distance_pct(trading) / 100.0 + trading.execution_cost_bps / 10000.0)
     if trading.sizing_mode == "equity":
         return equity * (trading.equity_pct / 100.0) * trading.leverage
     return trading.notional_usdt * trading.leverage
@@ -110,6 +111,7 @@ class Executor:
         self.dry_run = dry_run
         self.proxy = proxy
         self._equity = 0.0
+        self.allow_entries = True
         # 熔断是账户级的：一轮只看一次，不按 symbol 分开。四笔小亏加起来也
         # 能把账户打穿，逐个 symbol 查是看不见这件事的。
         # 阈值来自 config 的 risk 段；那里没配的就由 for_trading 按
@@ -140,6 +142,9 @@ class Executor:
                 live_side = "long" if raw_side == "long" else "short"
 
             if live_side != booked.side:
+                if getattr(self.broker, 'live', False) is True and booked.is_open and actual is None:
+                    self._settle_remote_close(symbol, booked, {})
+                    continue
                 problems.append(
                     f"{symbol}: exchange says {live_side!r}, ledger says {booked.side!r}"
                 )
@@ -202,6 +207,8 @@ class Executor:
             try:
                 self._poll_symbol(symbol)
             except (BrokerError, StateError) as exc:
+                if getattr(self.broker, 'live', False) is True:
+                    raise
                 # One bad symbol must not take down the other. Never place an
                 # order we are unsure about; log and move on.
                 logging.error("%s: %s", symbol, exc)
@@ -212,6 +219,13 @@ class Executor:
                                           self.config.candle_limit, self.proxy))
         series_15m = _closed(fetch_candles(symbol, self.config.bar_15m,
                                            self.config.candle_limit, self.proxy))
+        if getattr(self.broker, 'live', False) is True:
+            from .backtest import MINUTES_PER_BAR
+            now_ms = time.time() * 1000
+            for series, bar in ((series_5m, self.config.bar_5m), (series_15m, self.config.bar_15m)):
+                step = MINUTES_PER_BAR[bar] * 60000
+                if not series or not 0 <= now_ms - series[-1][0] - step <= step * 2:
+                    raise BrokerError(f'{symbol}: 实盘行情过期或尚未收盘，停止执行')
         ind_5m = calculate_indicators(series_5m, self.config.ema_fast,
                                       self.config.ema_slow, self.config.adx_period)
         ind_15m = calculate_indicators(series_15m, self.config.ema_fast,
@@ -253,6 +267,10 @@ class Executor:
             self._settle_remote_close(symbol, booked, ind_15m)
             return
 
+        if self.config.paper_strategy.entry_mode in ('trend', 'wave'):
+            signal, reason = self._profile_signal(symbol, ind_5m, ind_15m)
+            booked = self.ledger.get(symbol)
+
         if signal is None:
             if reason == REASON_NO_CROSS:
                 # The ordinary case: this bar simply had no crossover. Since the
@@ -282,6 +300,65 @@ class Executor:
 
         logging.info("%s: %s -> %s (%s)", symbol, booked.side, signal.side, signal.reason)
         self._flip(symbol, signal, booked)
+        if self.config.paper_strategy.entry_mode in ('trend', 'wave') and self.ledger.get(symbol).is_open:
+            state = self.ledger.strategy_state[symbol]
+            state['count'] = state.get('count', 0) + 1
+            state['peak'] = self.ledger.get(symbol).entry_price
+            self.ledger.save()
+
+    def _profile_signal(self, symbol, ind5, ind15):
+        from .backtest import MINUTES_PER_BAR
+        profile = self.config.paper_strategy
+        state = self.ledger.strategy_state.setdefault(symbol, {})
+        ts = int(ind5['ts'])
+        if ts <= state.get('last_bar', 0):
+            return None, REASON_NO_CROSS
+        state['last_bar'] = ts
+        env = 'long' if ind15['ema_fast'] > ind15['ema_slow'] else (
+            'short' if ind15['ema_fast'] < ind15['ema_slow'] else 'flat')
+        if state.get('env') != env:
+            state.update(env=env, count=0)
+        booked = self.ledger.get(symbol)
+        exit_reason = ''
+        if booked.is_open:
+            if profile.profit_trail_activation_pct:
+                peak, hit = profit_trailing_exit(booked.side, booked.entry_price,
+                    state.get('peak', booked.entry_price), ind5['close'],
+                    profile.profit_trail_activation_pct, profile.profit_trail_distance_pct)
+                state['peak'] = peak
+                if hit:
+                    exit_reason = 'profit-trail'
+            if profile.exit_on_trend_reversal and trend_reversed(booked.side, ind5, ind15):
+                exit_reason = 'trend-reversal'
+        self.ledger.save()
+        if exit_reason:
+            if not self.broker.close_position(symbol) and not self.dry_run:
+                raise BrokerError(f'{symbol}: 策略退出未确认')
+            self.broker.cancel_stops(symbol)
+            pnl = realized_pnl(self.broker, symbol, booked, self.broker.price(symbol))
+            self.ledger.clear(symbol)
+            state.update(last_exit_ms=int(time.time() * 1000), last_exit_side=booked.side,
+                         last_exit_loss=pnl is None or pnl < 0)
+            self.ledger.save()
+            if pnl is not None:
+                decision = self.guard.record_close(pnl)
+                if decision.halted:
+                    self._flatten(decision.close_symbols)
+            return None, exit_reason
+        signal, reason = classify_trend(ind5, ind15, self.config.adx_min, self.config.deviation_max)
+        count = state.get('count', 0)
+        if profile.entry_mode == 'wave' and count:
+            signal = evaluate_wave(ind5, ind15, self.config.adx_min, self.config.deviation_max)
+        if not self.ledger.get(symbol).is_open:
+            if (profile.max_entries_per_trend and count >= profile.max_entries_per_trend
+                    or profile.one_entry_per_trend and count):
+                return None, 'trend entry limit'
+            cooldown = profile.reentry_cooldown_bars * MINUTES_PER_BAR[self.config.bar_5m] * 60000
+            if (signal and (profile.entry_mode == 'wave' or (
+                    state.get('last_exit_side') == signal.side and state.get('last_exit_loss')))
+                    and ts + MINUTES_PER_BAR[self.config.bar_5m] * 60000 < state.get('last_exit_ms', 0) + cooldown):
+                return None, 'reentry cooldown'
+        return signal, reason
 
     # ----------------------------------------------------------------- actions
     def _closed_remotely(self, symbol: str) -> bool:
@@ -296,6 +373,8 @@ class Executor:
         try:
             return self.broker.get_position(symbol) is None
         except BrokerError as exc:
+            if getattr(self.broker, 'live', False) is True:
+                raise
             logging.warning("%s: 读不到交易所持仓（%s）—本轮不动账本", symbol, exc)
             return False
 
@@ -316,6 +395,9 @@ class Executor:
         pnl = (None if booked.settled else
                realized_pnl(self.broker, symbol, booked, exit_price))
         self.ledger.clear(symbol)
+        self.ledger.strategy_state.setdefault(symbol, {}).update(
+            last_exit_ms=int(time.time() * 1000), last_exit_side=booked.side,
+            last_exit_loss=pnl is None or pnl < 0)
         self.ledger.last_exit[symbol] = f"{booked.side}:{ind_15m.get('ts')}"
         self.ledger.save()
 
@@ -376,8 +458,25 @@ class Executor:
             else:
                 logging.warning("%s: 这一笔的盈亏算不出来，未计入风控计数", symbol)
 
+        if not self.allow_entries:
+            return
         equity = self.broker.verify_demo() if not self.dry_run else self._equity
         exposure = exposure_for(self.trading, equity)
+        positions = []
+        for held in self.ledger.open_symbols():
+            booked = self.ledger.get(held)
+            positions.append(dict(side=booked.side, entry_price=booked.entry_price,
+                                  stop_price=booked.stop_price,
+                                  notional=self.broker.notional_for_contracts(
+                                      held, booked.size, booked.entry_price)))
+        try:
+            exposure = bounded_exposure(self.trading, equity, exposure, signal.side, positions)
+        except ValueError as exc:
+            logging.warning('%s: entry blocked: %s', symbol, exc)
+            return
+        if exposure <= 0:
+            logging.info('%s: portfolio risk budget exhausted', symbol)
+            return
 
         held_notional = sum(
             self.broker.notional_for_contracts(
@@ -411,10 +510,16 @@ class Executor:
         # requested number instead would ask for a position the account cannot
         # support at the lower leverage.
         effective = self.broker.set_leverage(symbol, self.trading.leverage)
+        client_id = f"{symbol.split('-')[0]}{time.time_ns()}"
+        if getattr(self.broker, 'live', False) is True:
+            if self.ledger.pending_entry:
+                raise BrokerError('实盘存在待核对入场意图，禁止重复下单')
+            self.ledger.pending_entry = dict(symbol=symbol, client_id=client_id, side=signal.side)
+            self.ledger.save()
         fill = self.broker.market_entry(
             symbol, signal.side, exposure / max(self.trading.leverage, 1),
             effective, fixed_stop_pct(self.trading),
-            client_id=f"{symbol.split('-')[0]}{int(time.time())}",
+            client_id=client_id,
             take_profit_pct=self.trading.take_profit_pct,
         )
         self.ledger.set(symbol, Position(
@@ -427,6 +532,7 @@ class Executor:
             stop_price=fill.stop_price,
             take_profit_price=fill.take_profit_price,
         ))
+        self.ledger.pending_entry = {}
         self.ledger.save()
         logging.info("%s: holding %s | entry=%.6f size=%s stop=%.6f tp=%s",
                      symbol, signal.side, fill.price, fill.size, fill.stop_price,

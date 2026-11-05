@@ -6,18 +6,19 @@ defineProps({ symbol: String })
 const emit = defineEmits(['select'])
 const data = ref(null)
 const mode = ref('hot')
-const period = ref('rolling')
+const period = ref('session')
 const busy = ref(false)
 const error = ref('')
 let timer
 let disposed = false
-const board = computed(() => period.value === 'rolling' ? data.value?.rolling
+const board = computed(() => period.value === 'session' ? data.value?.session : period.value === 'rolling' ? data.value?.rolling
   : period.value === 'today' ? data.value?.today
     : data.value?.history.days.find(d => d.date === period.value))
-const historical = computed(() => !['rolling', 'today'].includes(period.value))
+const historical = computed(() => !['session', 'rolling', 'today'].includes(period.value))
 const rows = computed(() => mode.value === 'hot' ? (data.value?.hot || [])
   : (board.value?.[mode.value] || []))
-const change = row => mode.value === 'hot' || period.value === 'rolling' ? row.change24h
+const change = row => mode.value === 'hot' || period.value === 'session' ? row.change_session
+  : period.value === 'rolling' ? row.change24h
   : period.value === 'today' ? row.change_today : row.change
 const pct = value => value == null ? '—' : `${value > 0 ? '+' : ''}${(value * 100).toFixed(2)}%`
 const price = value => value == null ? '—' : Number(value).toLocaleString('en-US', { maximumSignificantDigits: 7 })
@@ -37,7 +38,7 @@ async function load() {
     error.value = err.message
   } finally {
     busy.value = false
-    if (!disposed) timer = setTimeout(load, data.value?.history.loading ? 5000 : 60000)
+    if (!disposed) timer = setTimeout(load, data.value?.history.loading ? 5000 : 30000)
   }
 }
 onMounted(load)
@@ -55,18 +56,19 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
     </div>
     <label v-if="mode !== 'hot'" class="rankings__period">统计时间
       <select v-model="period" class="input" aria-label="排行统计日期">
+        <option value="session">北京时间 08:00 起算</option>
         <option value="rolling">最近 24 小时</option>
-        <option value="today">今天 · {{ data?.today_date || '北京时间' }}</option>
+        <option value="today">北京零点起算 · {{ data?.today_date || '北京时间' }}</option>
         <option v-for="day in data?.history.days || []" :key="day.date" :value="day.date">{{ day.date }}</option>
       </select>
     </label>
     <p v-if="error" class="rankings__error" role="alert">{{ error }}{{ data ? '；下方为上次结果，可能已过期。' : '' }}</p>
-    <p v-if="mode === 'hot'" class="rankings__note">按近 24h 估算成交额排序，每 5 分钟更新；非 OKX App 人气榜。</p>
-    <p v-else class="rankings__note">{{ historical ? '已收盘日线：收盘价相对开盘价' : period === 'today' ? '北京时间 00:00 至今，尚未收盘' : '滚动 24 小时，不等于自然日' }}<br>已覆盖 {{ board?.covered || 0 }} / {{ data?.total || 0 }} 个当前在市合约</p>
+    <p v-if="mode === 'hot'" class="rankings__note">按近 24h 估算成交额排序；涨跌幅从北京时间 08:00 起算，每 30 秒更新。</p>
+    <p v-else class="rankings__note">{{ historical ? '已收盘日线：北京时间 00:00 开盘至收盘' : period === 'session' ? '北京时间 08:00 起算（UTC 零点），尚未收盘' : period === 'today' ? '北京时间 00:00 至今，尚未收盘' : '滚动 24 小时，不等于自然日' }}<br>已覆盖 {{ board?.covered || 0 }} / {{ data?.total || 0 }} 个当前在市合约</p>
     <p v-if="mode !== 'hot' && historical && data?.history.loading" class="rankings__note" role="status">正在补齐日线 {{ data.history.processed }} / {{ data.history.total }}，当前为部分排行。</p>
     <p v-if="mode !== 'hot' && historical && (data?.history.failed || data?.history.error)" class="rankings__error">{{ data.history.error || `${data.history.failed} 个合约日线获取失败，当前排行不完整。` }}</p>
     <p v-if="mode !== 'hot' && historical && data?.history.stale" class="rankings__error">跨日更新中，历史数据尚未刷新。</p>
-    <div class="rankings__head"><span>币种 / {{ mode === 'hot' ? '估算成交额 USDT' : historical ? '当日收盘价' : '最新价' }}</span><span>{{ mode === 'hot' ? '24h 涨跌' : '涨跌幅' }}</span></div>
+    <div class="rankings__head"><span>币种 / {{ mode === 'hot' ? '估算成交额 USDT' : historical ? '当日收盘价' : '最新价' }}</span><span>{{ mode === 'hot' || period === 'session' ? '08:00 起涨跌' : '涨跌幅' }}</span></div>
     <div class="rankings__list">
       <button v-for="(row, index) in rows" :key="row.inst_id" class="rankings__row"
               :class="{ selected: symbol === row.base || symbol === row.inst_id }"

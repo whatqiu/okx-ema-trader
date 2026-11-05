@@ -28,6 +28,7 @@ class Credentials:
     api_key: str
     secret_key: str
     passphrase: str
+    demo: bool = True
 
     def __repr__(self) -> str:  # keep secrets out of tracebacks and logs
         return f"Credentials(profile={self.profile!r}, api_key='***', secret_key='***', passphrase='***')"
@@ -51,6 +52,11 @@ def _read_config(path: Path) -> dict:
 
 
 def load_demo_credentials(profile: str | None = None, path: Path | None = None) -> Credentials:
+    return load_credentials(profile, path, demo=True)
+
+
+def load_credentials(profile: str | None = None, path: Path | None = None, *,
+                     demo: bool = True) -> Credentials:
     """Return credentials for a demo profile, or raise.
 
     `profile=None` uses the file's `default_profile`. The chosen profile MUST
@@ -73,11 +79,13 @@ def load_demo_credentials(profile: str | None = None, path: Path | None = None) 
         )
 
     chosen = profiles[name]
-    if chosen.get("demo") is not True:
+    if demo and chosen.get("demo") is not True:
         raise CredentialsError(
             f"profile {name!r} is not a demo profile (needs `demo = true`). "
             f"Refusing to trade a non-demo account."
         )
+    if not demo and chosen.get('demo') is not False:
+        raise CredentialsError(f'profile {name!r} must explicitly declare demo = false for live trading')
 
     api_key = str(chosen.get("api_key", "")).strip()
     secret_key = str(chosen.get("secret_key", "")).strip()
@@ -92,7 +100,7 @@ def load_demo_credentials(profile: str | None = None, path: Path | None = None) 
             f"profile {name!r} has placeholder or empty {', '.join(missing)}; fill them in first"
         )
 
-    return Credentials(profile=name, api_key=api_key, secret_key=secret_key, passphrase=passphrase)
+    return Credentials(profile=name, api_key=api_key, secret_key=secret_key, passphrase=passphrase, demo=demo)
 
 
 def default_config_path() -> Path:

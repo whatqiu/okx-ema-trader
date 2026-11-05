@@ -331,7 +331,8 @@ class Store:
             sql += " WHERE " + " AND ".join(where)
         with self._connect() as conn:
             return [dict(r) for r in conn.execute(
-                sql + " ORDER BY created_at DESC LIMIT ?", [*params, int(limit)])]
+                sql + " ORDER BY COALESCE(closed_at, opened_at, created_at) DESC, id DESC LIMIT ?",
+                [*params, int(limit)])]
 
     def latest_closed_order(self, inst_id: str) -> dict | None:
         with self._connect() as conn:

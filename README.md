@@ -529,8 +529,12 @@ pytest 只发 warning **不判失败**——它们覆盖了全部策略语义和
 
 ## 安全边界
 
-`credentials.py` 拒绝非 demo profile，`Broker` 强制 sandbox 并校验
-`x-simulated-trading` 响应头。**代码里不存在连实盘的路径。**
+命令行执行器仍默认只接受 demo profile。网页「自动」页提供独立实盘入口：
+点击「切换实盘并启动（真实下单）」后，使用明确声明 `demo = false` 的本地
+`live` profile、`config/pilot.yaml` 与 `data/live-state.yaml`。实盘不会继承
+网页模拟账户的持仓；模拟策略可经冻结后的未来数据验证，达标后在实盘空仓时自动应用。
+准备方法与切换、暂停、重启行为见
+[本地一键实盘说明](docs/live-trading.md)。该入口会真实下单，代码测试不代表盈利验证。
 
 历史表格中的 `dd10x` 使用旧的满权益 10 倍敞口场景，并非当前 `risk` 模式的
 收益或回撤预测。当前默认是每笔 1% 风险预算、2% 价格止损、20 倍杠杆；

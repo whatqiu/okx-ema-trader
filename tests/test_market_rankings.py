@@ -122,14 +122,16 @@ def test_route_separates_today_from_24h_and_quotes_volume():
     try:
         rows = market.swap_tickers(fetch=lambda *args: [{
             "instId": "BTC-USDT-SWAP", "last": "120", "open24h": "100",
-            "sodUtc8": "150", "volCcy24h": "10", "ts": "123"}])
+            "sodUtc8": "150", "sodUtc0": "125", "volCcy24h": "10", "ts": "123"}])
         assert rows[0]["change24h"] == .2
         assert rows[0]["change_today"] == -.2
+        assert rows[0]['change_session'] == -.04
         assert rows[0]["vol_ccy24h"] == 1200
         with patch.object(main.deps, "store", return_value=MemoryStore()), \
                 patch.object(main.rankings.history, "snapshot", return_value={"days": []}):
             result = main.market_rankings()
         assert result["rolling"]["gainers"][0]["base"] == "BTC"
         assert result["today"]["losers"][0]["base"] == "BTC"
+        assert result['session']['losers'][0]['base'] == 'BTC'
     finally:
         market.reset_swap_ticker_cache()

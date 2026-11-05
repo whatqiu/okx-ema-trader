@@ -21,7 +21,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -33,6 +33,8 @@ import autotrader
 import health
 import notifications
 import rankings
+import execution
+import learning
 from okx_ema_trader.backtest import MINUTES_PER_BAR, simulate
 from okx_ema_trader.jsonio import json_safe as _json_safe
 from okx_ema_trader.symbols import SymbolError
@@ -295,6 +297,8 @@ async def lifespan(app: FastAPI):
         _watch(_inst, _boot_cfg.bar_5m, pin=True)
         _watch(_inst, _boot_cfg.bar_15m, pin=True)
     _auto_stop.clear()
+    execution.live.restore()
+    learning.learner.start(_auto_stop)
     _janitor_stop.clear()
     email_thread = threading.Thread(target=notifications.run, args=(_auto_stop,),
                                     daemon=True, name="signal-email")
@@ -320,6 +324,7 @@ async def lifespan(app: FastAPI):
     boot_sync.start()
     yield
     _auto_stop.set()
+    execution.live.shutdown()
     _janitor_stop.set()
     _poller.stop()
     market.stop_warmer()
@@ -327,6 +332,49 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="okx-ema-trader platform", lifespan=lifespan)
+
+
+@app.middleware('http')
+async def execution_boundary(request: Request, call_next):
+    from urllib.parse import urlparse
+    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        if request.url.path.startswith('/api/execution'):
+            origin = request.headers.get('origin')
+            if (request.client.host not in ('127.0.0.1', '::1', 'testclient')
+                    or request.url.hostname not in ('127.0.0.1', 'localhost', '::1', 'testserver')
+                    or (origin and urlparse(origin).netloc != request.headers.get('host'))):
+                return JSONResponse(status_code=403, content={'detail': '实盘控制仅允许本机同源请求'})
+        if execution.live.snapshot()['mode'] == 'live' and (
+                request.url.path.startswith('/api/trade/')
+                or request.url.path in ('/api/autotrade', '/api/account/reset')):
+            return JSONResponse(status_code=409, content={'detail': '当前为实盘环境，模拟交易操作已禁用'})
+    return await call_next(request)
+
+
+class ExecutionSwitch(BaseModel):
+    action: Literal['live', 'paper', 'pause']
+
+
+@app.get('/api/execution')
+def execution_state():
+    return _json_safe(execution.live.snapshot())
+
+
+@app.get('/api/learning')
+def learning_state():
+    state = learning.registry(deps.store())
+    return _json_safe({**state, 'enabled': True})
+
+
+@app.post('/api/execution')
+def execution_switch(patch: ExecutionSwitch):
+    try:
+        return _json_safe({'live': execution.live.activate, 'paper': execution.live.paper,
+                           'pause': execution.live.pause}[patch.action]())
+    except Exception as exc:
+        log.exception('执行环境切换失败')
+        detail = str(exc) if isinstance(exc, ValueError) else '实盘切换失败，请检查本地凭证、网络和日志；未启用新交易'
+        raise HTTPException(status_code=409, detail=detail) from None
 
 
 # --------------------------------------------------------------------------
@@ -484,7 +532,7 @@ def ticker(symbol: str = Query(...)):
         cached = _poller.latest_ticker(inst)
         if cached and cached.get("ts"):
             age_ms = int(time.time() * 1000) - int(cached["ts"])
-            if age_ms < 15_000:
+            if age_ms < 15_000 and cached.get('sodUtc0') is not None:
                 return _json_safe(cached)
     tick = _okx(lambda: market.fetch_ticker(store, inst), label=f"ticker {inst}")
     return _json_safe(tick)
@@ -498,6 +546,7 @@ def market_rankings():
     return _json_safe({"source": "OKX", "timezone": "UTC+8", "total": len(rows),
                        "today_date": rankings.day_key(), "hot": hot,
                        "rolling": rankings.leaders(rows, "change24h"),
+                       "session": rankings.leaders(rows, "change_session"),
                        "today": rankings.leaders(rows, "change_today"),
                        "history": rankings.history.snapshot(deps.store(), rows)})
 

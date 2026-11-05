@@ -1,0 +1,33 @@
+symbol: ETH-USDT-SWAP
+bar_5m: 5m
+bar_15m: 15m
+candle_limit: 200
+strategy:
+  ema_fast: 20
+  ema_slow: 50
+  adx_period: 14
+  adx_min: 20
+  deviation_max: 0.02
+  entry_mode: crossover
+  pullback_tolerance: 0.002
+runtime:
+  reconnect_seconds: 5
+  log_level: INFO
+trading:
+  enabled: false
+  symbols: [ETH-USDT-SWAP, BTC-USDT-SWAP]
+  sizing_mode: risk
+  risk_per_trade_pct: 0.25
+  leverage: 3
+  exit_mode: fixed
+  stop_loss_pct: 1.5
+  take_profit_pct: 0
+  execution_cost_bps: 20
+  max_portfolio_risk_pct: 0.75
+  max_same_side_risk_pct: 0.5
+  max_total_notional: 3000
+  position_mode: cross
+risk:
+  max_drawdown_pct: 5
+  max_consecutive_losses: 3
+  max_position_loss_pct: 0.5

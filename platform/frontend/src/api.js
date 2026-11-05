@@ -22,6 +22,12 @@ async function request(path, options = {}) {
 }
 
 export const api = {
+  learning: () => request('/api/learning'),
+  execution: () => request('/api/execution'),
+  switchExecution: (action) => request('/api/execution', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action }),
+  }),
   // Liveness of this process only (never upstream state) — see backend note.
   health: () => request('/api/health'),
   rankings: () => request('/api/market/rankings'),

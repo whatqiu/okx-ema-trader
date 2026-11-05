@@ -166,9 +166,12 @@ def test_margin_failure_recorded_not_raised():
                          notional=10_000_000, leverage=1)
     out = autotrader.maybe_trade(store, INST, signal_fn=long_sig,
                                  ticker_fn=fake_tick)
-    check("error" in out, "margin failure must surface as error, not crash")
-    state = autotrader.get_state(store)
-    check("可用余额不足" in state["last_error"], "error not persisted for UI")
+    check(out.get('opened'), f'risk sizing should bound an oversized request: {out}')
+    order = store.open_orders(INST)[0]
+    import deps
+    from okx_ema_trader.executor import exposure_for
+    check(order['notional'] <= exposure_for(deps.config().trading, 10000),
+          'oversized UI request bypassed single-trade risk budget')
     store.close(); tmp.cleanup()
 
 

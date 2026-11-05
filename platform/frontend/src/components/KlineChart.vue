@@ -64,6 +64,7 @@ const props = defineProps({
   emaFast: { type: Number, default: 9 },
   emaSlow: { type: Number, default: 26 },
   markers: { type: Array, default: () => [] },     // [{ts, side, price}]
+  currentPrice: { type: Number, default: null },
 })
 
 const canvasRef = ref(null)
@@ -106,7 +107,9 @@ const emaSlowArr = computed(() =>
   emaSeries(props.rows.map(r => r[4]), props.emaSlow))
 
 const lastPrice = computed(() =>
-  props.rows.length ? props.rows[props.rows.length - 1][4] : null)
+  Number.isFinite(props.currentPrice) && props.currentPrice > 0
+    ? props.currentPrice
+    : props.rows.length ? props.rows[props.rows.length - 1][4] : null)
 
 const lastChangePct = computed(() => {
   if (props.rows.length < 2) return null
@@ -337,6 +340,19 @@ ctx.fillStyle = '#0a0d12'
         ctx.fillStyle = LABEL_TX
         ctx.textAlign = 'left'
         ctx.fillText(formatPrice(p), W - PAD_R + 6, my + 3)
+        if (my >= 0 && Number.isFinite(lastPrice.value) && lastPrice.value > 0) {
+          const delta = (p - lastPrice.value) / lastPrice.value * 100
+          const rounded = Number(delta.toFixed(2))
+          const label = `距现价 ${rounded > 0 ? '+' : ''}${rounded.toFixed(2)}%`
+          ctx.font = '12px sans-serif'
+          const width = ctx.measureText(label).width + 16
+          const left = Math.max(PAD_L, Math.min(mx + 14, W - PAD_R - width))
+          const top = Math.max(20, Math.min(my + 14, priceH - 26))
+          ctx.fillStyle = LABEL_BG
+          ctx.fillRect(left, top, width, 24)
+          ctx.fillStyle = rounded > 0 ? UP : rounded < 0 ? DOWN : LABEL_TX
+          ctx.fillText(label, left + 8, top + 16)
+        }
       }
       const up = r[4] >= r[1]
       const c = up ? UP : DOWN
@@ -416,7 +432,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('mouseup', onUp)
 })
 // New data must not yank a panned view back to the edge: only redraw.
-watch(() => [props.rows, props.markers], draw, { deep: true })
+watch(() => [props.rows, props.markers, props.currentPrice], draw, { deep: true })
 </script>
 
 <template>

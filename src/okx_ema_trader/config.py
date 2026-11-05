@@ -27,6 +27,9 @@ class TradingConfig:
     take_profit_pct: float = 0.0
     max_total_notional: float = 300.0
     position_mode: str = "cross"
+    execution_cost_bps: float = 0.0
+    max_portfolio_risk_pct: float = 0.0
+    max_same_side_risk_pct: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -189,6 +192,9 @@ def load_config(path: str | Path) -> Config:
         take_profit_pct=float(trading.get("take_profit_pct", 0.0)),
         max_total_notional=float(trading.get("max_total_notional", 300.0)),
         position_mode=str(trading.get("position_mode", "cross")),
+        execution_cost_bps=float(trading.get("execution_cost_bps", 0)),
+        max_portfolio_risk_pct=float(trading.get("max_portfolio_risk_pct", 0)),
+        max_same_side_risk_pct=float(trading.get("max_same_side_risk_pct", 0)),
     )
 
     risk_raw = raw.get("risk") or {}
@@ -269,6 +275,12 @@ def validate(config: Config) -> None:
         raise ValueError(f"reconnect_seconds must be >= 1, got {config.reconnect_seconds}")
 
     trading = config.trading
+    for name in ('execution_cost_bps', 'max_portfolio_risk_pct', 'max_same_side_risk_pct'):
+        value = getattr(trading, name)
+        if not math.isfinite(value) or not 0 <= value <= 100:
+            raise ValueError(f'{name} must be finite and in [0, 100]')
+    if (trading.max_portfolio_risk_pct or trading.max_same_side_risk_pct) and trading.exit_mode != 'fixed':
+        raise ValueError('portfolio risk budgets require fixed stops')
     if trading.sizing_mode not in ("fixed", "equity", "risk"):
         raise ValueError(
             f"sizing_mode must be 'fixed', 'equity' or 'risk', got {trading.sizing_mode!r}")

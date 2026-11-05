@@ -128,6 +128,9 @@ class Ledger:
     # 信号」。同一个 15m 环境翻转会连续几根 5m bar 都发出同一方向的信号，
     # 止盈/止损成交后若立刻重进，等于刚离场就买回同一个仓位。
     last_exit: dict[str, str] = field(default_factory=dict)
+    pending_entry: dict = field(default_factory=dict)
+    strategy_state: dict = field(default_factory=dict)
+    strategy_release: dict = field(default_factory=dict)
 
     def get(self, symbol: str) -> Position:
         """Ledger's view of a symbol; flat when never traded."""
@@ -157,6 +160,9 @@ class Ledger:
             "positions": {sym: asdict(pos) for sym, pos in self.positions.items()},
             "risk": self.risk.to_dict(),
             "last_exit": dict(self.last_exit),
+            "pending_entry": dict(self.pending_entry),
+            "strategy_state": dict(self.strategy_state),
+            "strategy_release": dict(self.strategy_release),
         }
 
     def save(self) -> None:
@@ -221,4 +227,6 @@ class Ledger:
                      if isinstance(last_exit_raw, dict) else {})
         return cls(positions=positions, path=path,
                    risk=RiskState.from_dict(raw.get("risk") or {}),
-                   last_exit=last_exit)
+                   last_exit=last_exit, pending_entry=raw.get('pending_entry') or {},
+                   strategy_state=raw.get('strategy_state') or {},
+                   strategy_release=raw.get('strategy_release') or {})

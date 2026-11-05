@@ -131,8 +131,8 @@ function fmtPrice(v) {
         <b>{{ it.base }}</b>
         <span class="dim">/ USDT 永续</span>
         <span class="dd-right">
-          <span v-if="it.change24h != null" :class="it.change24h >= 0 ? 'up' : 'down'">
-            {{ fmtPct(it.change24h) }}
+          <span v-if="it.change_session != null" :class="it.change_session >= 0 ? 'up' : 'down'" title="北京时间 08:00 起算">
+            {{ fmtPct(it.change_session) }}
           </span>
           <span v-if="it.last != null">{{ fmtPrice(it.last) }}</span>
           <span class="dim">{{ fmtVol(it.vol_ccy24h) }}</span>

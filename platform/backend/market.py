@@ -350,6 +350,7 @@ def fetch_ticker(store, inst_id: str, fetch=None) -> dict:
         "inst_id": inst_id,
         "last": _f(raw.get("last")),
         "open24h": _f(raw.get("open24h")),
+        "sodUtc0": _f(raw.get("sodUtc0")),
         "high24h": _f(raw.get("high24h")),
         "low24h": _f(raw.get("low24h")),
         "vol24h": _f(raw.get("vol24h")),
@@ -365,7 +366,7 @@ def fetch_ticker(store, inst_id: str, fetch=None) -> dict:
 # --------------------------------------------------------------------------
 # Instrument discovery — what the symbol search combobox queries
 # --------------------------------------------------------------------------
-_TICKERS_TTL = 300.0  # seconds
+_TICKERS_TTL = 30.0
 _tickers_cache: tuple[float, list[dict]] | None = None
 _tickers_cache_day: int | None = None
 
@@ -373,7 +374,7 @@ _tickers_cache_day: int | None = None
 def swap_tickers(fetch=None, force: bool = False) -> list[dict]:
     """All USDT-margined SWAP tickers, sorted by 24h quote volume (desc).
 
-    Cached for 5 minutes: the full SWAP ticker list is one of the biggest
+    Cached for 30 seconds: the full SWAP ticker list is one of the biggest
     public payloads OKX serves, and the search box fires on every debounced
     keystroke — without a cache, typing "BTC" would mean three full
     downloads of every swap on the exchange inside our 20req/2s budget.
@@ -392,6 +393,7 @@ def swap_tickers(fetch=None, force: bool = False) -> list[dict]:
             continue
         last, open24 = _f(raw.get("last")), _f(raw.get("open24h"))
         day_open = _f(raw.get("sodUtc8"))
+        session_open = _f(raw.get("sodUtc0"))
         vol_ccy = _f(raw.get("volCcy24h")) or 0.0
         # volCcy24h is denominated in the COIN, not in USDT. Ranking by it
         # directly lets ultra-cheap tokens (SATS, PEPE — 45 trillion units of
@@ -403,6 +405,7 @@ def swap_tickers(fetch=None, force: bool = False) -> list[dict]:
             "vol_ccy24h": vol_ccy * last if last else 0.0,
             "change24h": (last - open24) / open24 if last and open24 else None,
             "change_today": (last - day_open) / day_open if last and day_open else None,
+            "change_session": (last - session_open) / session_open if last and session_open else None,
             "ts": raw.get("ts"),
         })
     rows.sort(key=lambda r: -r["vol_ccy24h"])
@@ -546,6 +549,7 @@ class MarketPoller:
             "inst_id": inst_id,
             "last": _f(raw.get("last")),
             "open24h": _f(raw.get("open24h")),
+            "sodUtc0": _f(raw.get("sodUtc0")),
             "high24h": _f(raw.get("high24h")),
             "low24h": _f(raw.get("low24h")),
             "vol24h": _f(raw.get("vol24h")),

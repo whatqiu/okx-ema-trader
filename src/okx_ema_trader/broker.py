@@ -18,6 +18,7 @@ Three things here are load-bearing:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 
@@ -75,8 +76,13 @@ def to_ccxt_symbol(symbol: str) -> str:
 
 
 class Broker:
+    live = False
+
     def __init__(self, credentials: Credentials, proxy: str | None = DEFAULT_PROXY,
-                 dry_run: bool = False) -> None:
+                 dry_run: bool = False, live: bool = False) -> None:
+        if live == credentials.demo:
+            raise BrokerError('Credential environment does not match selected trading environment')
+        self.live = live
         config: dict = {
             "apiKey": credentials.api_key,
             "secret": credentials.secret_key,
@@ -89,7 +95,8 @@ class Broker:
             config["proxies"] = {"http": proxy, "https": proxy}
 
         self.exchange = ccxt.okx(config)
-        self.exchange.set_sandbox_mode(True)
+        self.exchange.set_sandbox_mode(not live)
+        self.exchange.timeout = 10000
         self.dry_run = dry_run
         self.proxy = proxy
         self._markets_loaded = False
@@ -154,7 +161,8 @@ class Broker:
         The header check catches a build where sandbox was silently reset; the
         balance call proves the API key actually works against it.
         """
-        if self.exchange.headers.get("x-simulated-trading") != "1":
+        simulated = (self.exchange.headers or {}).get('x-simulated-trading')
+        if (not self.live and simulated != '1') or (self.live and simulated not in (None, '0')):
             raise BrokerError(
                 "sandbox header is not set — refusing to continue against a live endpoint"
             )
@@ -166,8 +174,26 @@ class Broker:
         if "USDT" not in balance:
             raise BrokerError("balance response has no USDT entry; unexpected for a swap account")
         total = float(balance["USDT"].get("total") or 0.0)
-        log.info("demo account verified | USDT equity=%.2f", total)
+        if self.live:
+            details = (balance.get('info') or {}).get('data') or []
+            usdt = [row for account in details for row in account.get('details', [])
+                    if row.get('ccy') == 'USDT']
+            if not usdt:
+                raise BrokerError('Live balance lacks USDT equity')
+            total = float(usdt[0]['eq'])
+        if not math.isfinite(total) or total <= 0:
+            raise BrokerError('Account equity must be positive and finite')
+        log.info("%s account verified | USDT equity=%.2f", 'live' if self.live else 'demo', total)
         return total
+
+    def verify_live_account(self) -> str:
+        if not self.live:
+            raise BrokerError('Live account verification requires live mode')
+        response = self.exchange.private_get_account_config()
+        rows = response.get('data') or []
+        if len(rows) != 1 or rows[0].get('posMode') != 'net_mode' or not rows[0].get('uid'):
+            raise BrokerError('实盘需要单向持仓模式及有效账户 UID，请在 OKX 设置后重试')
+        return str(rows[0]['uid'])
 
     # ------------------------------------------------------------- market data
     def price(self, symbol: str) -> float:
@@ -297,6 +323,14 @@ class Broker:
         except Exception as exc:
             raise BrokerError(f"entry order rejected for {symbol} {side}: {exc}") from exc
 
+        if self.live:
+            order_id = order.get('id')
+            if not order_id:
+                raise BrokerError('实盘入场响应缺少订单 ID，停止执行并等待人工对账')
+            order = self.exchange.fetch_order(order_id, to_ccxt_symbol(symbol))
+            if (order.get('status') != 'closed' or not order.get('average')
+                    or abs(float(order.get('filled') or 0) - size) > max(size * 1e-8, 1e-10)):
+                raise BrokerError('实盘入场尚未确认全部成交，停止执行并等待人工对账')
         fill_price = float(order.get("average") or order.get("price") or price)
         filled = float(order.get("filled") or size)
         stop_id = self._find_stop_id(symbol, order.get("id")) if stop_pct > 0 else ""
@@ -457,6 +491,8 @@ class Broker:
             self.exchange.create_order(market, "market", close_side, contracts, None, params)
         except Exception as exc:
             raise BrokerError(f"failed to close {symbol}: {exc}") from exc
+        if self.live and self.get_position(symbol) is not None:
+            raise BrokerError(f'{symbol}: 实盘平仓尚未确认，保留账本和止损单')
         log.info("closed %s (%s %s contracts)", symbol, close_side, contracts)
         return True
 
